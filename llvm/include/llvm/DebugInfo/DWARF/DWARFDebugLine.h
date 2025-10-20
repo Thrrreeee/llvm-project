@@ -246,6 +246,10 @@ public:
     /// or UnknownRowIndex if there is no such row.
     LLVM_ABI uint32_t lookupAddress(object::SectionedAddress Address,
                                     bool *IsApproximateLine = nullptr) const;
+    
+    /// Returns all indices of rows with file/line info for a given address.
+    /// Returns empty vector if there are no such rows.
+    LLVM_ABI std::vector<uint32_t> lookupAllAddresses(object::SectionedAddress Address) const;
 
     /// Fills the Result argument with the indices of the rows that correspond
     /// to the address range specified by \p Address and \p Size.
@@ -319,6 +323,11 @@ public:
 
     uint32_t lookupAddressImpl(object::SectionedAddress Address,
                                bool *IsApproximateLine = nullptr) const;
+    
+                                   /// Helper method for lookupAllAddresses to find all matching addresses
+    /// in a specific sequence.
+    void lookupAllAddressesImpl(object::SectionedAddress Address,
+                                std::vector<uint32_t> &Result) const;
 
     /// Fills the Result argument with the indices of the rows that correspond
     /// to the address range specified by \p Address and \p Size.

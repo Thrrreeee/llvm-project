@@ -18,6 +18,7 @@
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/DebugInfo/DWARF/DWARFCompileUnit.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
@@ -170,7 +171,7 @@ private:
   /// to a new temp symbol used with \p NewLoc.
   ///
   /// Return new current location which is either \p NewLoc or \p PrevLoc.
-  SMLoc emitLineInfo(const BinaryFunction &BF, SMLoc NewLoc, SMLoc PrevLoc,
+  SmallVector<SMLoc, 4> emitLineInfo(const BinaryFunction &BF, SmallVector<SMLoc, 4> NewLocs, SmallVector<SMLoc, 4> PrevLocs,
                      bool FirstInstr, MCSymbol *&InstrLabel);
 
   /// Use \p FunctionEndSymbol to mark the end of the line info sequence.
@@ -469,7 +470,7 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         Streamer.emitLabel(EntrySymbol);
     }
 
-    SMLoc LastLocSeen;
+    SmallVector<SMLoc, 4> LastLocSeen;
     for (auto I = BB->begin(), E = BB->end(); I != E; ++I) {
       MCInst &Instr = *I;
 
@@ -487,7 +488,7 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         MCSymbol *InstrLabel = BC.MIB->getInstLabel(Instr);
 
         if (opts::UpdateDebugSections && BF.getDWARFUnit()) {
-          LastLocSeen = emitLineInfo(BF, Instr.getLoc(), LastLocSeen,
+          LastLocSeen = emitLineInfo(BF, Instr.getLocs(), LastLocSeen,
                                      FirstInstr, InstrLabel);
           FirstInstr = false;
         }
@@ -676,67 +677,76 @@ void BinaryEmitter::emitConstantIslands(BinaryFunction &BF, bool EmitColdPart,
     emitConstantIslands(*ExternalFunc, EmitColdPart, &BF);
 }
 
-SMLoc BinaryEmitter::emitLineInfo(const BinaryFunction &BF, SMLoc NewLoc,
-                                  SMLoc PrevLoc, bool FirstInstr,
+SmallVector<SMLoc, 4>  BinaryEmitter::emitLineInfo(const BinaryFunction &BF, SmallVector<SMLoc, 4> NewLocs,
+                                  SmallVector<SMLoc, 4> PrevLocs, bool FirstInstr,
                                   MCSymbol *&InstrLabel) {
   DWARFUnit *FunctionCU = BF.getDWARFUnit();
   const DWARFDebugLine::LineTable *FunctionLineTable = BF.getDWARFLineTable();
   assert(FunctionCU && "cannot emit line info for function without CU");
 
-  DebugLineTableRowRef RowReference = DebugLineTableRowRef::fromSMLoc(NewLoc);
+  SmallVector<SMLoc, 4> ResultLocs;
+  
+  // 处理每个位置信息
+  for (size_t i = 0; i < NewLocs.size(); ++i) {
+    SMLoc NewLoc = NewLocs[i];
+    SMLoc PrevLoc = (i < PrevLocs.size()) ? PrevLocs[i] : SMLoc();
+    
+    DebugLineTableRowRef RowReference = DebugLineTableRowRef::fromSMLoc(NewLoc);
 
-  // Check if no new line info needs to be emitted.
-  if (RowReference == DebugLineTableRowRef::NULL_ROW ||
-      NewLoc.getPointer() == PrevLoc.getPointer())
-    return PrevLoc;
+    // Check if no new line info needs to be emitted.
+    if (RowReference == DebugLineTableRowRef::NULL_ROW ||
+        NewLoc.getPointer() == PrevLoc.getPointer()) {
+      ResultLocs.push_back(PrevLoc);
+      continue;
+    }
 
-  unsigned CurrentFilenum = 0;
-  const DWARFDebugLine::LineTable *CurrentLineTable = FunctionLineTable;
+    unsigned CurrentFilenum = 0;
+    const DWARFDebugLine::LineTable *CurrentLineTable = FunctionLineTable;
 
-  // If the CU id from the current instruction location does not
-  // match the CU id from the current function, it means that we
-  // have come across some inlined code.  We must look up the CU
-  // for the instruction's original function and get the line table
-  // from that.
-  const uint64_t FunctionUnitIndex = FunctionCU->getOffset();
-  const uint32_t CurrentUnitIndex = RowReference.DwCompileUnitIndex;
-  if (CurrentUnitIndex != FunctionUnitIndex) {
-    CurrentLineTable = BC.DwCtx->getLineTableForUnit(
-        BC.DwCtx->getCompileUnitForOffset(CurrentUnitIndex));
-    // Add filename from the inlined function to the current CU.
-    CurrentFilenum = BC.addDebugFilenameToUnit(
-        FunctionUnitIndex, CurrentUnitIndex,
-        CurrentLineTable->Rows[RowReference.RowIndex - 1].File);
+    // If the CU id from the current instruction location does not
+    // match the CU id from the current function, it means that we
+    // have come across some inlined code.
+    const uint64_t FunctionUnitIndex = FunctionCU->getOffset();
+    const uint32_t CurrentUnitIndex = RowReference.DwCompileUnitIndex;
+    if (CurrentUnitIndex != FunctionUnitIndex) {
+      CurrentLineTable = BC.DwCtx->getLineTableForUnit(
+          BC.DwCtx->getCompileUnitForOffset(CurrentUnitIndex));
+      // Add filename from the inlined function to the current CU.
+      CurrentFilenum = BC.addDebugFilenameToUnit(
+          FunctionUnitIndex, CurrentUnitIndex,
+          CurrentLineTable->Rows[RowReference.RowIndex - 1].File);
+    }
+
+    const DWARFDebugLine::Row &CurrentRow =
+        CurrentLineTable->Rows[RowReference.RowIndex - 1];
+    if (!CurrentFilenum)
+      CurrentFilenum = CurrentRow.File;
+
+    unsigned Flags = (DWARF2_FLAG_IS_STMT * CurrentRow.IsStmt) |
+                     (DWARF2_FLAG_BASIC_BLOCK * CurrentRow.BasicBlock) |
+                     (DWARF2_FLAG_PROLOGUE_END * CurrentRow.PrologueEnd) |
+                     (DWARF2_FLAG_EPILOGUE_BEGIN * CurrentRow.EpilogueBegin);
+
+    // Always emit is_stmt at the beginning of function fragment.
+    if (FirstInstr)
+      Flags |= DWARF2_FLAG_IS_STMT;
+    BC.Ctx->setCurrentDwarfLoc(CurrentFilenum, CurrentRow.Line, CurrentRow.Column,
+                               Flags, CurrentRow.Isa, CurrentRow.Discriminator);
+    const MCDwarfLoc &DwarfLoc = BC.Ctx->getCurrentDwarfLoc();
+    BC.Ctx->clearDwarfLocSeen();
+
+    if (!InstrLabel)
+      InstrLabel = BC.Ctx->createTempSymbol();
+
+    BC.getDwarfLineTable(FunctionUnitIndex)
+        .getMCLineSections()
+        .addLineEntry(MCDwarfLineEntry(InstrLabel, DwarfLoc),
+                      Streamer.getCurrentSectionOnly());
+
+    ResultLocs.push_back(NewLoc);
   }
 
-  const DWARFDebugLine::Row &CurrentRow =
-      CurrentLineTable->Rows[RowReference.RowIndex - 1];
-  if (!CurrentFilenum)
-    CurrentFilenum = CurrentRow.File;
-
-  unsigned Flags = (DWARF2_FLAG_IS_STMT * CurrentRow.IsStmt) |
-                   (DWARF2_FLAG_BASIC_BLOCK * CurrentRow.BasicBlock) |
-                   (DWARF2_FLAG_PROLOGUE_END * CurrentRow.PrologueEnd) |
-                   (DWARF2_FLAG_EPILOGUE_BEGIN * CurrentRow.EpilogueBegin);
-
-  // Always emit is_stmt at the beginning of function fragment.
-  if (FirstInstr)
-    Flags |= DWARF2_FLAG_IS_STMT;
-
-  BC.Ctx->setCurrentDwarfLoc(CurrentFilenum, CurrentRow.Line, CurrentRow.Column,
-                             Flags, CurrentRow.Isa, CurrentRow.Discriminator);
-  const MCDwarfLoc &DwarfLoc = BC.Ctx->getCurrentDwarfLoc();
-  BC.Ctx->clearDwarfLocSeen();
-
-  if (!InstrLabel)
-    InstrLabel = BC.Ctx->createTempSymbol();
-
-  BC.getDwarfLineTable(FunctionUnitIndex)
-      .getMCLineSections()
-      .addLineEntry(MCDwarfLineEntry(InstrLabel, DwarfLoc),
-                    Streamer.getCurrentSectionOnly());
-
-  return NewLoc;
+  return ResultLocs;
 }
 
 void BinaryEmitter::emitLineInfoEnd(const BinaryFunction &BF,

@@ -183,7 +183,7 @@ template <typename R> static bool emptyRange(const R &Range) {
 /// to point to this information, which is represented by a
 /// DebugLineTableRowRef. The returned pointer is null if no debug line
 /// information for this instruction was found.
-static SMLoc findDebugLineInformationForInstructionAt(
+static std::vector<SMLoc> findDebugLineInformationForInstructionAt(
     uint64_t Address, DWARFUnit *Unit,
     const DWARFDebugLine::LineTable *LineTable) {
   // We use the pointer in SMLoc to store an instance of DebugLineTableRowRef,
@@ -192,24 +192,30 @@ static SMLoc findDebugLineInformationForInstructionAt(
   static_assert(
       sizeof(decltype(SMLoc().getPointer())) >= sizeof(DebugLineTableRowRef),
       "Cannot fit instruction debug line information into SMLoc's pointer");
-
+  std::vector<SMLoc> Results;
   SMLoc NullResult = DebugLineTableRowRef::NULL_ROW.toSMLoc();
-  uint32_t RowIndex = LineTable->lookupAddress(
+  std::vector<uint32_t> RowIndexs = LineTable->lookupAllAddresses(
       {Address, object::SectionedAddress::UndefSection});
-  if (RowIndex == LineTable->UnknownRowIndex)
-    return NullResult;
+  if (RowIndexs.empty()) {
+    Results.push_back(NullResult);
+    return Results;
+  }
 
-  assert(RowIndex < LineTable->Rows.size() &&
-         "Line Table lookup returned invalid index.");
+  for (uint32_t RowIndex : RowIndexs) {
+    assert(RowIndex < LineTable->Rows.size() &&
+           "Line Table lookup returned invalid index.");
 
-  decltype(SMLoc().getPointer()) Ptr;
-  DebugLineTableRowRef *InstructionLocation =
-      reinterpret_cast<DebugLineTableRowRef *>(&Ptr);
+    decltype(SMLoc().getPointer()) Ptr;
+    DebugLineTableRowRef *InstructionLocation =
+        reinterpret_cast<DebugLineTableRowRef *>(&Ptr);
 
-  InstructionLocation->DwCompileUnitIndex = Unit->getOffset();
-  InstructionLocation->RowIndex = RowIndex + 1;
+    InstructionLocation->DwCompileUnitIndex = Unit->getOffset();
+    InstructionLocation->RowIndex = RowIndex + 1;
 
-  return SMLoc::getFromPointer(Ptr);
+    Results.push_back(SMLoc::getFromPointer(Ptr));
+  }
+
+  return Results;
 }
 
 static std::string buildSectionName(StringRef Prefix, StringRef Name,
@@ -1497,8 +1503,10 @@ Error BinaryFunction::disassemble() {
 
 add_instruction:
     if (getDWARFLineTable()) {
-      Instruction.setLoc(findDebugLineInformationForInstructionAt(
-          AbsoluteInstrAddr, getDWARFUnit(), getDWARFLineTable()));
+      std::vector<SMLoc> locs = findDebugLineInformationForInstructionAt(
+              AbsoluteInstrAddr, getDWARFUnit(), getDWARFLineTable());
+      SmallVector<SMLoc, 4> smallLocs(locs.begin(), locs.end());
+      Instruction.setLocs(std::move(smallLocs));
     }
 
     // Record offset of the instruction for profile matching.

@@ -1369,6 +1369,49 @@ DWARFDebugLine::LineTable::lookupAddressImpl(object::SectionedAddress Address,
   return RowIndex;
 }
 
+// Add this new method to DWARFDebugLine::LineTable class
+
+std::vector<uint32_t>
+DWARFDebugLine::LineTable::lookupAllAddresses(object::SectionedAddress Address) const {
+  std::vector<uint32_t> Result;
+  
+  // Search for relocatable addresses
+  lookupAllAddressesImpl(Address, Result);
+  
+  if (!Result.empty() || Address.SectionIndex == object::SectionedAddress::UndefSection)
+    return Result;
+    
+  // Search for absolute addresses
+  Address.SectionIndex = object::SectionedAddress::UndefSection;
+  lookupAllAddressesImpl(Address, Result);
+  
+  return Result;
+}
+
+void DWARFDebugLine::LineTable::lookupAllAddressesImpl(
+    object::SectionedAddress Address, std::vector<uint32_t> &Result) const {
+  
+  // First, find an instruction sequence containing the given address.
+  DWARFDebugLine::Sequence Sequence;
+  Sequence.SectionIndex = Address.SectionIndex;
+  Sequence.HighPC = Address.Address;
+  SequenceIter It = llvm::upper_bound(Sequences, Sequence,
+                                      DWARFDebugLine::Sequence::orderByHighPC);
+  if (It == Sequences.end() || It->SectionIndex != Address.SectionIndex)
+    return;
+
+  // Find all rows with matching address in this sequence
+  RowIter FirstRow = Rows.begin() + It->FirstRowIndex;
+  RowIter LastRow = Rows.begin() + It->LastRowIndex;
+  
+  for (RowIter RowIt = FirstRow; RowIt != LastRow; ++RowIt) {
+    if (RowIt->Address.Address == Address.Address && 
+        RowIt->Address.SectionIndex == Address.SectionIndex) {
+      Result.push_back(RowIt - Rows.begin());
+    }
+  }
+}
+
 bool DWARFDebugLine::LineTable::lookupAddressRange(
     object::SectionedAddress Address, uint64_t Size,
     std::vector<uint32_t> &Result,

@@ -1769,7 +1769,11 @@ void BinaryContext::preprocessDebugInfo() {
       continue;
     }
     const uint32_t Offset = DwarfVersion < 5 ? 1 : 0;
-    for (size_t I = 0, Size = FileNames.size(); I != Size; ++I) {
+    size_t I = 0;
+    if (DwarfVersion >= 5) {
+      I = 1;
+    }
+    for (size_t Size = FileNames.size(); I != Size; ++I) {
       // Dir indexes start at 1, as DWARF file numbers, and a dir index 0
       // means empty dir.
       StringRef Dir = "";
@@ -1907,31 +1911,33 @@ bool BinaryContext::isMarker(const SymbolRef &Symbol) const {
 static void printDebugInfo(raw_ostream &OS, const MCInst &Instruction,
                            const BinaryFunction *Function,
                            DWARFContext *DwCtx) {
-  DebugLineTableRowRef RowRef =
-      DebugLineTableRowRef::fromSMLoc(Instruction.getLoc());
-  if (RowRef == DebugLineTableRowRef::NULL_ROW)
-    return;
+  for(auto loc : Instruction.getLocs()){
+    DebugLineTableRowRef RowRef =
+        DebugLineTableRowRef::fromSMLoc(loc);
+    if (RowRef == DebugLineTableRowRef::NULL_ROW)
+      return;
 
-  const DWARFDebugLine::LineTable *LineTable;
-  if (Function && Function->getDWARFUnit() &&
-      Function->getDWARFUnit()->getOffset() == RowRef.DwCompileUnitIndex) {
-    LineTable = Function->getDWARFLineTable();
-  } else {
-    LineTable = DwCtx->getLineTableForUnit(
-        DwCtx->getCompileUnitForOffset(RowRef.DwCompileUnitIndex));
+    const DWARFDebugLine::LineTable *LineTable;
+    if (Function && Function->getDWARFUnit() &&
+        Function->getDWARFUnit()->getOffset() == RowRef.DwCompileUnitIndex) {
+      LineTable = Function->getDWARFLineTable();
+    } else {
+      LineTable = DwCtx->getLineTableForUnit(
+          DwCtx->getCompileUnitForOffset(RowRef.DwCompileUnitIndex));
+    }
+    assert(LineTable && "line table expected for instruction with debug info");
+
+    const DWARFDebugLine::Row &Row = LineTable->Rows[RowRef.RowIndex - 1];
+    StringRef FileName = "";
+    if (std::optional<const char *> FName =
+            dwarf::toString(LineTable->Prologue.FileNames[Row.File - 1].Name))
+      FileName = *FName;
+    OS << " # debug line " << FileName << ":" << Row.Line;
+    if (Row.Column)
+      OS << ":" << Row.Column;
+    if (Row.Discriminator)
+      OS << " discriminator:" << Row.Discriminator;
   }
-  assert(LineTable && "line table expected for instruction with debug info");
-
-  const DWARFDebugLine::Row &Row = LineTable->Rows[RowRef.RowIndex - 1];
-  StringRef FileName = "";
-  if (std::optional<const char *> FName =
-          dwarf::toString(LineTable->Prologue.FileNames[Row.File - 1].Name))
-    FileName = *FName;
-  OS << " # debug line " << FileName << ":" << Row.Line;
-  if (Row.Column)
-    OS << ":" << Row.Column;
-  if (Row.Discriminator)
-    OS << " discriminator:" << Row.Discriminator;
 }
 
 ArrayRef<uint8_t> BinaryContext::extractData(uint64_t Address,

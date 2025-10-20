@@ -194,7 +194,7 @@ class MCInst {
 
   SMLoc Loc;
   SmallVector<MCOperand, 6> Operands;
-
+  SmallVector<SMLoc, 4> Locs;
 public:
   MCInst() = default;
 
@@ -207,6 +207,19 @@ public:
   void setLoc(SMLoc loc) { Loc = loc; }
   SMLoc getLoc() const { return Loc; }
 
+
+  size_t getNumLocs() const { return Locs.size(); }
+  void addLoc(const SMLoc &loc) { Locs.push_back(loc); }
+  void setLocs(SmallVector<SMLoc, 4>&&locs) {
+    Locs = std::move(locs);
+  }
+  const SmallVector<SMLoc, 4> &getLocs() const { return Locs; }
+  // Locs迭代器类型
+  using loc_iterator = SmallVector<SMLoc, 4>::iterator;
+  using const_loc_iterator = SmallVector<SMLoc, 4>::const_iterator;
+
+  void clearLocs() { Locs.clear(); }
+  
   const MCOperand &getOperand(unsigned i) const { return Operands[i]; }
   MCOperand &getOperand(unsigned i) { return Operands[i]; }
   unsigned getNumOperands() const { return Operands.size(); }

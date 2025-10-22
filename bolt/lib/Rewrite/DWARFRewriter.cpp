@@ -91,6 +91,62 @@ static void printDie(DWARFUnit &DU, uint64_t DIEOffset) {
 
 using namespace bolt;
 
+/// Expand ranges to cover all cloned instances by consulting the AddressMap.
+/// For each range in PrimaryRanges derived from the primary function, check if
+/// the input address has multiple outputs (clones) in the AddressMap. If so,
+/// replicate the range at each clone's offset.
+static DebugAddressRangesVector
+expandRangesToCoverClones(const BinaryContext &BC,
+                          const DebugAddressRangesVector &PrimaryRanges,
+                          const DWARFAddressRangesVector &InputRanges) {
+  if (!BC.IOAddressMap || InputRanges.empty() || PrimaryRanges.empty())
+    return PrimaryRanges;
+
+  const AddressMap &AddrMap = BC.getIOAddressMap();
+  DebugAddressRangesVector ExpandedRanges = PrimaryRanges;
+
+  // For each input range, check if there are clones in the AddressMap
+  for (const DWARFAddressRange &InputRange : InputRanges) {
+    std::vector<uint64_t> AllOutputs = AddrMap.getAllOutputs(InputRange.LowPC);
+    
+    // If we have more than one output for this input address, we have clones
+    if (AllOutputs.size() > 1) {
+      // Find the primary output address (the one we already have in PrimaryRanges)
+      std::optional<uint64_t> PrimaryOutput = AddrMap.lookup(InputRange.LowPC);
+      if (!PrimaryOutput)
+        continue;
+
+      // Calculate the delta for this range
+      uint64_t RangeSize = InputRange.HighPC - InputRange.LowPC;
+
+      // Add ranges for each clone
+      for (uint64_t CloneOutput : AllOutputs) {
+        if (CloneOutput == *PrimaryOutput)
+          continue; // Skip the primary, already in PrimaryRanges
+
+        // Add the range at the clone's offset
+        ExpandedRanges.emplace_back(CloneOutput, CloneOutput + RangeSize);
+      }
+    }
+  }
+
+  // Sort and merge the expanded ranges
+  llvm::sort(ExpandedRanges);
+  DebugAddressRangesVector MergedRanges;
+  uint64_t PrevHighPC = 0;
+  for (const DebugAddressRange &Range : ExpandedRanges) {
+    if (Range.LowPC <= PrevHighPC) {
+      MergedRanges.back().HighPC =
+          std::max(MergedRanges.back().HighPC, Range.HighPC);
+    } else {
+      MergedRanges.emplace_back(Range.LowPC, Range.HighPC);
+    }
+    PrevHighPC = MergedRanges.back().HighPC;
+  }
+
+  return MergedRanges;
+}
+
 /// Take a set of DWARF address ranges corresponding to the input binary and
 /// translate them to a set of address ranges in the output binary.
 static DebugAddressRangesVector
@@ -127,6 +183,67 @@ translateInputToOutputRanges(const BinaryFunction &BF,
   }
 
   return MergedRanges;
+}
+
+/// Expand location lists to cover all cloned instances by consulting the
+/// AddressMap. Similar to expandRangesToCoverClones but for location lists.
+static DebugLocationsVector
+expandLocationListsToCoverClones(const BinaryContext &BC,
+                                 const DebugLocationsVector &PrimaryLL,
+                                 const DebugLocationsVector &InputLL) {
+  if (!BC.IOAddressMap || InputLL.empty() || PrimaryLL.empty())
+    return PrimaryLL;
+
+  const AddressMap &AddrMap = BC.getIOAddressMap();
+  DebugLocationsVector ExpandedLL = PrimaryLL;
+
+  // For each input location entry, check if there are clones in the AddressMap
+  for (const DebugLocationEntry &InputEntry : InputLL) {
+    std::vector<uint64_t> AllOutputs = AddrMap.getAllOutputs(InputEntry.LowPC);
+    
+    // If we have more than one output for this input address, we have clones
+    if (AllOutputs.size() > 1) {
+      // Find the primary output address
+      std::optional<uint64_t> PrimaryOutput = AddrMap.lookup(InputEntry.LowPC);
+      if (!PrimaryOutput)
+        continue;
+
+      // Calculate the delta for this location entry
+      uint64_t RangeSize = InputEntry.HighPC - InputEntry.LowPC;
+
+      // Add location entries for each clone
+      for (uint64_t CloneOutput : AllOutputs) {
+        if (CloneOutput == *PrimaryOutput)
+          continue; // Skip the primary, already in PrimaryLL
+
+        // Add the location entry at the clone's offset
+        ExpandedLL.emplace_back(
+            DebugLocationEntry{CloneOutput, CloneOutput + RangeSize,
+                              InputEntry.Expr});
+      }
+    }
+  }
+
+  // Sort and merge the expanded location list
+  llvm::stable_sort(ExpandedLL,
+                    [](const DebugLocationEntry &A,
+                       const DebugLocationEntry &B) { return A.LowPC < B.LowPC; });
+  DebugLocationsVector MergedLL;
+  uint64_t PrevHighPC = 0;
+  const SmallVectorImpl<uint8_t> *PrevExpr = nullptr;
+  for (const DebugLocationEntry &Entry : ExpandedLL) {
+    if (Entry.LowPC <= PrevHighPC && PrevExpr && *PrevExpr == Entry.Expr) {
+      MergedLL.back().HighPC = std::max(Entry.HighPC, MergedLL.back().HighPC);
+    } else {
+      const uint64_t Begin = std::max(Entry.LowPC, PrevHighPC);
+      const uint64_t End = std::max(Begin, Entry.HighPC);
+      MergedLL.emplace_back(DebugLocationEntry{Begin, End, Entry.Expr});
+    }
+    PrevHighPC = MergedLL.back().HighPC;
+    PrevExpr = &MergedLL.back().Expr;
+  }
+
+  return MergedLL;
 }
 
 /// Similar to translateInputToOutputRanges() but operates on location lists.
@@ -880,6 +997,7 @@ void DWARFRewriter::updateUnitDebugInfo(
       uint64_t Address = UINT64_MAX;
       uint64_t SectionIndex, HighPC;
       DebugAddressRangesVector FunctionRanges;
+      DWARFAddressRangesVector InputRanges;
       if (!getLowAndHighPC(*Die, Unit, Address, HighPC, SectionIndex)) {
         Expected<DWARFAddressRangesVector> RangesOrError =
             getDIEAddressRanges(*Die, Unit);
@@ -887,21 +1005,27 @@ void DWARFRewriter::updateUnitDebugInfo(
           consumeError(RangesOrError.takeError());
           break;
         }
-        DWARFAddressRangesVector Ranges = *RangesOrError;
+        InputRanges = *RangesOrError;
         // Not a function definition.
-        if (Ranges.empty())
+        if (InputRanges.empty())
           break;
 
-        for (const DWARFAddressRange &Range : Ranges) {
+        for (const DWARFAddressRange &Range : InputRanges) {
           if (const BinaryFunction *Function =
                   BC.getBinaryFunctionAtAddress(Range.LowPC))
             FunctionRanges.append(Function->getOutputAddressRanges());
         }
       } else {
+        // Create input range from low/high PC
+        InputRanges.push_back(DWARFAddressRange{Address, HighPC});
         if (const BinaryFunction *Function =
                 BC.getBinaryFunctionAtAddress(Address))
           FunctionRanges = Function->getOutputAddressRanges();
       }
+
+      // Expand function ranges to cover cloned instances
+      if (!InputRanges.empty())
+        FunctionRanges = expandRangesToCoverClones(BC, FunctionRanges, InputRanges);
 
       // Clear cached ranges as the new function will have its own set.
       CachedRanges.clear();
@@ -940,6 +1064,8 @@ void DWARFRewriter::updateUnitDebugInfo(
       DebugAddressRangesVector OutputRanges;
       if (Function) {
         OutputRanges = translateInputToOutputRanges(*Function, *RangesOrError);
+        // Expand ranges to cover cloned instances
+        OutputRanges = expandRangesToCoverClones(BC, OutputRanges, *RangesOrError);
         LLVM_DEBUG(if (OutputRanges.empty() != RangesOrError->empty()) {
           dbgs() << "BOLT-DEBUG: problem with DIE at 0x"
                  << Twine::utohexstr(Die->getOffset()) << " in CU at 0x"
@@ -1100,6 +1226,8 @@ void DWARFRewriter::updateUnitDebugInfo(
             if (const BinaryFunction *Function =
                     BC.getBinaryFunctionContainingAddress(Address)) {
               OutputLL = translateInputToOutputLocationList(*Function, InputLL);
+              // Expand location lists to cover cloned instances
+              OutputLL = expandLocationListsToCoverClones(BC, OutputLL, InputLL);
               LLVM_DEBUG(if (OutputLL.empty()) {
                 dbgs() << "BOLT-DEBUG: location list translated to an empty "
                           "one at 0x"

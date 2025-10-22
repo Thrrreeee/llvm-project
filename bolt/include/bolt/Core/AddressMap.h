@@ -35,6 +35,13 @@ class BinaryContext;
 ///
 /// The entities that can be mapped to output address are input addresses and
 /// labels (MCSymbol). Input addresses support one-to-many mapping.
+///
+/// One-to-many mapping semantics:
+/// - A single input address can map to multiple output addresses when functions
+///   or basic blocks are cloned, split, or outlined during optimization.
+/// - All output addresses for a given input address are preserved in the map.
+/// - Use lookup() to get the first (primary) output address.
+/// - Use lookupAll() or getAllOutputs() to get all output addresses for clones.
 class AddressMap {
   static const char *const AddressSectionName;
   static const char *const LabelSectionName;
@@ -69,6 +76,16 @@ public:
   std::pair<Addr2AddrMapTy::const_iterator, Addr2AddrMapTy::const_iterator>
   lookupAll(uint64_t InputAddress) const {
     return Address2AddressMap.equal_range(InputAddress);
+  }
+
+  /// Convenience wrapper to get all output addresses for an input address.
+  /// Returns an empty vector if no mapping exists.
+  std::vector<uint64_t> getAllOutputs(uint64_t InputAddress) const {
+    std::vector<uint64_t> Outputs;
+    auto Range = lookupAll(InputAddress);
+    for (auto It = Range.first; It != Range.second; ++It)
+      Outputs.push_back(It->second);
+    return Outputs;
   }
 };
 

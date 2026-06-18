@@ -96,11 +96,6 @@
   Creates .debug_names section, if the input binary doesn't have it already, for
   DWARF5 CU/TUs.
 
-- `--cu-processing-batch-size=<uint>`
-
-  Specifies the size of batches for processing CUs. Higher number has better
-  performance, but more memory usage. Default value is 1.
-
 - `--data=<string>`
 
   data file

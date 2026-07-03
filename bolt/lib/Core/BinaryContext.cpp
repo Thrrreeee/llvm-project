@@ -550,23 +550,23 @@ MCSymbol *BinaryContext::handleExternalBranchTarget(uint64_t Address,
          "Address should be inside the referenced function");
 
   bool IsValid = true;
-  if (Source.NeedBranchValidation) {
-    if (Target.CurrentState == BinaryFunction::State::Disassembled &&
-        !Target.getInstructionAtOffset(Offset)) {
-      this->errs()
-          << "BOLT-WARNING: corrupted control flow detected in function "
-          << Source
-          << ": an external branch/call targets an invalid instruction "
-          << "in function " << Target << " at address 0x"
-          << Twine::utohexstr(Address) << "; ignoring both functions\n";
-      IsValid = false;
-    }
-    if (Target.isInConstantIsland(Address)) {
-      this->errs() << "BOLT-WARNING: ignoring entry point at address 0x"
-                   << Twine::utohexstr(Address)
-                   << " in constant island of function " << Target << '\n';
-      IsValid = false;
-    }
+  if (Source.NeedBranchValidation &&
+      Target.CurrentState == BinaryFunction::State::Disassembled &&
+      !Target.getInstructionAtOffset(Offset)) {
+    this->errs()
+        << "BOLT-WARNING: corrupted control flow detected in function "
+        << Source
+        << ": an external branch/call targets an invalid instruction "
+        << "in function " << Target << " at address 0x"
+        << Twine::utohexstr(Address) << "; ignoring both functions\n";
+    IsValid = false;
+  }
+
+  if (Target.isInConstantIsland(Address)) {
+    this->errs() << "BOLT-WARNING: ignoring entry point at address 0x"
+                 << Twine::utohexstr(Address)
+                 << " in constant island of function " << Target << '\n';
+    IsValid = false;
   }
 
   if (!IsValid) {

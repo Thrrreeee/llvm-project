@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MCTargetDesc/RISCVMCAsmInfo.h"
+#include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "bolt/Core/MCPlusBuilder.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -221,9 +222,26 @@ public:
     case RISCV::C_J:
     case RISCV::C_JR:
       break;
+    case RISCV::BEQ:
+    case RISCV::BNE:
+    case RISCV::BGE:
+    case RISCV::BGEU:
+    case RISCV::BLT:
+    case RISCV::BLTU:
+    case RISCV::C_BEQZ:
+    case RISCV::C_BNEZ:
+      return false;
     }
 
     setTailCall(Inst);
+    return true;
+  }
+
+  bool convertTailCallToJmp(MCInst &Inst) override {
+    removeAnnotation(Inst, MCPlus::MCAnnotation::kTailCall);
+    clearOffset(Inst);
+    if (getConditionalTailCall(Inst))
+      unsetConditionalTailCall(Inst);
     return true;
   }
 
@@ -328,6 +346,7 @@ public:
     default:
       return false;
     case RISCV::C_J:
+    case RISCV::PseudoTAIL:
       OpNum = 0;
       return true;
     case RISCV::AUIPC:
@@ -428,6 +447,76 @@ public:
     Value = Inst.getOperand(ImmOpNo).getImm();
     setOperandToSymbolRef(Inst, ImmOpNo, Symbol, Addend, Ctx, RelType);
     return true;
+  }
+
+  std::optional<Relocation>
+  createRelocation(const MCFixup &Fixup,
+                   const MCAsmBackend &MAB) const override {
+    const MCFixupKind Kind = Fixup.getKind();
+
+    uint32_t RelType;
+    if (mc::isRelocation(Kind)) {
+      RelType = Kind >= FirstLiteralRelocationKind
+                    ? Kind - FirstLiteralRelocationKind
+                    : Kind;
+    } else if (Fixup.isPCRel()) {
+      switch (Kind) {
+      default:
+        return std::nullopt;
+      case FK_Data_4:
+        RelType = ELF::R_RISCV_32_PCREL;
+        break;
+      case RISCV::fixup_riscv_pcrel_hi20:
+        RelType = ELF::R_RISCV_PCREL_HI20;
+        break;
+      case RISCV::fixup_riscv_pcrel_lo12_i:
+        RelType = ELF::R_RISCV_PCREL_LO12_I;
+        break;
+      case RISCV::fixup_riscv_pcrel_lo12_s:
+        RelType = ELF::R_RISCV_PCREL_LO12_S;
+        break;
+      case RISCV::fixup_riscv_jal:
+        RelType = ELF::R_RISCV_JAL;
+        break;
+      case RISCV::fixup_riscv_branch:
+        RelType = ELF::R_RISCV_BRANCH;
+        break;
+      case RISCV::fixup_riscv_rvc_jump:
+        RelType = ELF::R_RISCV_RVC_JUMP;
+        break;
+      case RISCV::fixup_riscv_rvc_branch:
+        RelType = ELF::R_RISCV_RVC_BRANCH;
+        break;
+      case RISCV::fixup_riscv_call:
+      case RISCV::fixup_riscv_call_plt:
+        RelType = ELF::R_RISCV_CALL_PLT;
+        break;
+      }
+    } else {
+      switch (Kind) {
+      default:
+        return std::nullopt;
+      case FK_Data_4:
+        RelType = ELF::R_RISCV_32;
+        break;
+      case FK_Data_8:
+        RelType = ELF::R_RISCV_64;
+        break;
+      case RISCV::fixup_riscv_hi20:
+        RelType = ELF::R_RISCV_HI20;
+        break;
+      case RISCV::fixup_riscv_lo12_i:
+        RelType = ELF::R_RISCV_LO12_I;
+        break;
+      case RISCV::fixup_riscv_lo12_s:
+        RelType = ELF::R_RISCV_LO12_S;
+        break;
+      }
+    }
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: RISCV createRelocation kind "
+                      << Fixup.getKind() << " -> type " << RelType << '\n');
+    auto [RelSymbol, RelAddend] = extractFixupExpr(Fixup);
+    return Relocation({Fixup.getOffset(), RelSymbol, RelType, RelAddend, 0});
   }
 
   const MCExpr *getTargetExprFor(MCInst &Inst, const MCExpr *Expr,
@@ -817,7 +906,7 @@ public:
                            .addReg(RISCV::X5)
                            .addImm((Imm >> 12) & 0xFFFFF));
     Insts.emplace_back(
-        MCInstBuilder(RISCV::LUI).addReg(RISCV::X6).addImm((Imm)&0xFFF));
+        MCInstBuilder(RISCV::LUI).addReg(RISCV::X6).addImm((Imm) & 0xFFF));
     Insts.emplace_back(MCInstBuilder(RISCV::SRLI)
                            .addReg(RISCV::X6)
                            .addReg(RISCV::X6)

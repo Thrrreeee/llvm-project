@@ -35,6 +35,7 @@
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/GenericDomTreeConstruction.h"
 #include "llvm/Support/GenericLoopInfoImpl.h"
 #include "llvm/Support/GraphWriter.h"
@@ -1498,6 +1499,37 @@ Error BinaryFunction::disassemble() {
           handleAArch64IndirectCall(Instruction, Offset);
       }
     } else if (BC.isRISCV()) {
+      auto getRISCVPCRelValueFor =
+          [&](uint64_t HI20Offset, uint32_t HI20RelType) -> std::optional<int64_t> {
+        if (HI20Offset + 4 > FunctionData.size())
+          return std::nullopt;
+        const uint32_t HIContents =
+            support::endian::read32le(FunctionData.data() + HI20Offset);
+        int64_t Value = Relocation::extractValue(
+            HI20RelType, HIContents, getAddress() + HI20Offset);
+
+        for (auto RI = Relocations.begin(), RE = Relocations.end(); RI != RE;
+             ++RI) {
+          const Relocation &Rel = RI->second;
+          if (Rel.Type != ELF::R_RISCV_PCREL_LO12_I &&
+              Rel.Type != ELF::R_RISCV_PCREL_LO12_S)
+            continue;
+          if (Rel.Value != getAddress() + HI20Offset)
+            continue;
+
+          const uint64_t RelOffset = RI->first;
+          if (RelOffset + 4 > FunctionData.size())
+            return std::nullopt;
+
+          const uint32_t Contents =
+              support::endian::read32le(FunctionData.data() + RelOffset);
+          Value += Relocation::extractValue(Rel.Type, Contents,
+                                            getAddress() + RelOffset);
+          return Value;
+        }
+        return std::nullopt;
+      };
+
       // Check if there's a relocation associated with this instruction.
       for (auto Itr = Relocations.lower_bound(Offset),
                 ItrE = Relocations.lower_bound(Offset + Size);
@@ -1526,6 +1558,9 @@ Error BinaryFunction::disassemble() {
                  "GOT relocation must be PC-relative on RISC-V");
           Symbol = BC.registerNameAtAddress("__BOLT_got_zero", 0, 0, 0);
           Addend = Relocation.Value + Relocation.Offset + getAddress();
+          if (std::optional<int64_t> Value =
+                  getRISCVPCRelValueFor(Offset, Relocation.Type))
+            Addend = *Value + Relocation.Offset + getAddress();
         }
         int64_t Value = Relocation.Value;
         const bool Result = BC.MIB->replaceImmWithSymbolRef(

@@ -324,11 +324,87 @@ static uint64_t encodeValueAArch64(uint32_t Type, uint64_t Value, uint64_t PC) {
   return Value;
 }
 
+static uint32_t encodeUImmRISCV(uint64_t Value) {
+  // Add 1 if bit 11 is 1, to compensate for low 12 bits being negative.
+  return ((Value + 0x800) >> 12) & 0xfffff;
+}
+
+static uint32_t encodeIImmRISCV(uint64_t Value) { return Value & 0xfff; }
+
+static uint32_t encodeSImmRISCV(uint64_t Value) {
+  return (((Value >> 5) & 0x7f) << 25) | ((Value & 0x1f) << 7);
+}
+
+static uint32_t encodeJImmRISCV(uint64_t Value) {
+  assert(isInt<21>(Value) && "fixup value out of range");
+  assert(!(Value & 0x1) && "fixup value must be 2-byte aligned");
+  const unsigned Sbit = (Value >> 20) & 0x1;
+  const unsigned Hi8 = (Value >> 12) & 0xff;
+  const unsigned Mid1 = (Value >> 11) & 0x1;
+  const unsigned Lo10 = (Value >> 1) & 0x3ff;
+  return (Sbit << 31) | (Lo10 << 21) | (Mid1 << 20) | (Hi8 << 12);
+}
+
+static uint32_t encodeBImmRISCV(uint64_t Value) {
+  assert(isInt<13>(Value) && "fixup value out of range");
+  assert(!(Value & 0x1) && "fixup value must be 2-byte aligned");
+  const unsigned Sbit = (Value >> 12) & 0x1;
+  const unsigned Hi1 = (Value >> 11) & 0x1;
+  const unsigned Mid6 = (Value >> 5) & 0x3f;
+  const unsigned Lo4 = (Value >> 1) & 0xf;
+  return (Sbit << 31) | (Mid6 << 25) | (Lo4 << 8) | (Hi1 << 7);
+}
+
+static uint16_t encodeCJImmRISCV(uint64_t Value) {
+  assert(isInt<12>(Value) && "fixup value out of range");
+  assert(!(Value & 0x1) && "fixup value must be 2-byte aligned");
+  const unsigned Bit11 = (Value >> 11) & 0x1;
+  const unsigned Bit4 = (Value >> 4) & 0x1;
+  const unsigned Bit9_8 = (Value >> 8) & 0x3;
+  const unsigned Bit10 = (Value >> 10) & 0x1;
+  const unsigned Bit6 = (Value >> 6) & 0x1;
+  const unsigned Bit7 = (Value >> 7) & 0x1;
+  const unsigned Bit3_1 = (Value >> 1) & 0x7;
+  const unsigned Bit5 = (Value >> 5) & 0x1;
+  return (Bit11 << 12) | (Bit4 << 11) | (Bit9_8 << 9) | (Bit10 << 8) |
+         (Bit6 << 7) | (Bit7 << 6) | (Bit3_1 << 3) | (Bit5 << 2);
+}
+
+static uint16_t encodeCBImmRISCV(uint64_t Value) {
+  assert(isInt<9>(Value) && "fixup value out of range");
+  assert(!(Value & 0x1) && "fixup value must be 2-byte aligned");
+  const unsigned Bit8 = (Value >> 8) & 0x1;
+  const unsigned Bit7_6 = (Value >> 6) & 0x3;
+  const unsigned Bit5 = (Value >> 5) & 0x1;
+  const unsigned Bit4_3 = (Value >> 3) & 0x3;
+  const unsigned Bit2_1 = (Value >> 1) & 0x3;
+  return (Bit8 << 12) | (Bit4_3 << 10) | (Bit7_6 << 5) |
+         (Bit2_1 << 3) | (Bit5 << 2);
+}
+
 static uint64_t canEncodeValueRISCV(uint32_t Type, uint64_t Value,
                                     uint64_t PC) {
   switch (Type) {
   default:
     llvm_unreachable("unsupported relocation");
+  case ELF::R_RISCV_JAL:
+    return isInt<21>(Value - PC);
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    return isInt<32>(Value - PC);
+  case ELF::R_RISCV_BRANCH:
+    return isInt<13>(Value - PC);
+  case ELF::R_RISCV_RVC_JUMP:
+    return isInt<12>(Value - PC);
+  case ELF::R_RISCV_RVC_BRANCH:
+    return isInt<9>(Value - PC);
+  case ELF::R_RISCV_PCREL_HI20:
+  case ELF::R_RISCV_PCREL_LO12_I:
+  case ELF::R_RISCV_PCREL_LO12_S:
+  case ELF::R_RISCV_HI20:
+  case ELF::R_RISCV_LO12_I:
+  case ELF::R_RISCV_LO12_S:
+    return true;
   case ELF::R_RISCV_32:
   case ELF::R_RISCV_64:
     return true;
@@ -344,6 +420,45 @@ static uint64_t encodeValueRISCV(uint32_t Type, uint64_t Value, uint64_t PC) {
     break;
   }
   return Value;
+}
+
+static uint64_t encodeValueRISCV(uint32_t Type, uint64_t Value, uint64_t PC,
+                                 uint64_t Contents) {
+  switch (Type) {
+  default:
+    return encodeValueRISCV(Type, Value, PC);
+  case ELF::R_RISCV_JAL:
+    Value -= PC;
+    return (Contents & 0x00000fff) | encodeJImmRISCV(Value);
+  case ELF::R_RISCV_BRANCH:
+    Value -= PC;
+    return (Contents & 0x01fff07f) | encodeBImmRISCV(Value);
+  case ELF::R_RISCV_PCREL_HI20:
+  case ELF::R_RISCV_HI20:
+    if (Type == ELF::R_RISCV_PCREL_HI20)
+      Value -= PC;
+    return (Contents & 0x00000fff) | (uint64_t(encodeUImmRISCV(Value)) << 12);
+  case ELF::R_RISCV_PCREL_LO12_I:
+  case ELF::R_RISCV_LO12_I:
+    return (Contents & 0x000fffff) | (uint64_t(encodeIImmRISCV(Value)) << 20);
+  case ELF::R_RISCV_PCREL_LO12_S:
+  case ELF::R_RISCV_LO12_S:
+    return (Contents & 0x01fff07f) | encodeSImmRISCV(Value);
+  case ELF::R_RISCV_RVC_JUMP:
+    Value -= PC;
+    return (Contents & 0xe003) | encodeCJImmRISCV(Value);
+  case ELF::R_RISCV_RVC_BRANCH:
+    Value -= PC;
+    return (Contents & 0xe383) | encodeCBImmRISCV(Value);
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT: {
+    Value -= PC;
+    const uint64_t UpperImm = (Value + 0x800ULL) & 0xfffff000ULL;
+    const uint64_t LowerImm = Value & 0xfffULL;
+    const uint64_t Encoded = UpperImm | ((LowerImm << 20) << 32);
+    return (Contents & 0x000fffff000fffffULL) | Encoded;
+  }
+  }
 }
 
 static uint64_t extractValueX86(uint32_t Type, uint64_t Contents, uint64_t PC) {
@@ -773,6 +888,21 @@ uint64_t Relocation::encodeValue(uint32_t Type, uint64_t Value, uint64_t PC) {
   case Triple::riscv64:
   case Triple::riscv32:
     return encodeValueRISCV(Type, Value, PC);
+  case Triple::x86_64:
+    return encodeValueX86(Type, Value, PC);
+  }
+}
+
+uint64_t Relocation::encodeValue(uint32_t Type, uint64_t Value, uint64_t PC,
+                                 uint64_t Contents) {
+  switch (Arch) {
+  default:
+    llvm_unreachable("Unsupported architecture");
+  case Triple::aarch64:
+    return encodeValueAArch64(Type, Value, PC);
+  case Triple::riscv64:
+  case Triple::riscv32:
+    return encodeValueRISCV(Type, Value, PC, Contents);
   case Triple::x86_64:
     return encodeValueX86(Type, Value, PC);
   }

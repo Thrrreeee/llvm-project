@@ -85,6 +85,8 @@ public:
 
   /// Adjust value depending on relocation type (make it PC relative or not).
   static uint64_t encodeValue(uint32_t Type, uint64_t Value, uint64_t PC);
+  static uint64_t encodeValue(uint32_t Type, uint64_t Value, uint64_t PC,
+                              uint64_t Contents);
 
   /// Return true if there are enough bits to encode the relocation value.
   static bool canEncodeValue(uint32_t Type, uint64_t Value, uint64_t PC);

@@ -470,9 +470,15 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         continue;
       }
 
+      // A symbol to be emitted before the instruction to mark its location.
+      //
+      // On RISC-V this label is part of the instruction semantics: a
+      // %pcrel_lo relocation points at the corresponding %pcrel_hi instruction
+      // label. Emit it even for code-only layout passes so MC can resolve the
+      // HI/LO pair while assembling.
+      MCSymbol *InstrLabel = BC.MIB->getInstLabel(Instr);
+
       if (!EmitCodeOnly) {
-        // A symbol to be emitted before the instruction to mark its location.
-        MCSymbol *InstrLabel = BC.MIB->getInstLabel(Instr);
 
         if (opts::UpdateDebugSections && !BF.getDWARFUnits().empty()) {
           LastLocSeen = emitLineInfo(BF, Instr.getLoc(), LastLocSeen,
@@ -489,9 +495,10 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
           BB->getLocSyms().emplace_back(Offset, InstrLabel);
         }
 
-        if (InstrLabel)
-          Streamer.emitLabel(InstrLabel);
       }
+
+      if (InstrLabel)
+        Streamer.emitLabel(InstrLabel);
 
       // Emit sized NOPs via MCAsmBackend::writeNopData() interface on x86.
       // This is a workaround for invalid NOPs handling by asm/disasm layer.

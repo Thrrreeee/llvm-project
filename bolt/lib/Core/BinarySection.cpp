@@ -16,6 +16,7 @@
 #include "bolt/Utils/Utils.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Endian.h"
 
 #define DEBUG_TYPE "bolt"
 
@@ -191,16 +192,29 @@ void BinarySection::flushPendingRelocations(raw_pwrite_stream &OS,
       ++SkippedPendingRelocations;
       continue;
     }
+    uint64_t OriginalValue = 0;
+    const size_t RelocationSize = Relocation::getSizeForType(Reloc.Type);
+    const StringRef OriginalContents = getContents();
+    if (Reloc.Offset + RelocationSize <= OriginalContents.size()) {
+      const uint8_t *Data = reinterpret_cast<const uint8_t *>(
+          OriginalContents.bytes_begin() + Reloc.Offset);
+      if (RelocationSize == 2)
+        OriginalValue = support::endian::read16le(Data);
+      else if (RelocationSize == 4)
+        OriginalValue = support::endian::read32le(Data);
+      else if (RelocationSize == 8)
+        OriginalValue = support::endian::read64le(Data);
+    }
     Value = Relocation::encodeValue(Reloc.Type, Value,
-                                    SectionAddress + Reloc.Offset);
+                                    SectionAddress + Reloc.Offset,
+                                    OriginalValue);
 
     OS.pwrite(reinterpret_cast<const char *>(&Value),
-              Relocation::getSizeForType(Reloc.Type),
-              SectionFileOffset + Reloc.Offset);
+              RelocationSize, SectionFileOffset + Reloc.Offset);
 
     LLVM_DEBUG(
         dbgs() << "BOLT-DEBUG: writing value 0x" << Twine::utohexstr(Value)
-               << " of size " << Relocation::getSizeForType(Reloc.Type)
+               << " of size " << RelocationSize
                << " at section offset 0x" << Twine::utohexstr(Reloc.Offset)
                << " address 0x"
                << Twine::utohexstr(SectionAddress + Reloc.Offset)

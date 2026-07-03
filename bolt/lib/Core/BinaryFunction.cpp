@@ -1859,21 +1859,21 @@ bool BinaryFunction::scanExternalRefs() {
 
     // Create relocation for every fixup.
     for (const MCFixup &Fixup : Fixups) {
-      BC.errs() << "BOLT-DEBUG: createRelocation input at 0x"
-                << Twine::utohexstr(AbsoluteInstrAddr) << " in " << *this
-                << '\n';
-      BC.printInstruction(BC.errs(), Instruction, AbsoluteInstrAddr);
-      for (const MCFixup &Fixup : Fixups) {
-        BC.errs() << "  fixup kind=" << Fixup.getKind()
-                  << " offset=" << Fixup.getOffset()
-                  << " pcrel=" << Fixup.isPCRel()
-                  << " relax=" << Fixup.isLinkerRelaxable() << " expr=";
+      LLVM_DEBUG({
+        dbgs() << "BOLT-DEBUG: createRelocation input at 0x"
+               << Twine::utohexstr(AbsoluteInstrAddr) << " in " << *this
+               << '\n';
+        BC.printInstruction(dbgs(), Instruction, AbsoluteInstrAddr);
+        dbgs() << "  fixup kind=" << Fixup.getKind()
+               << " offset=" << Fixup.getOffset()
+               << " pcrel=" << Fixup.isPCRel()
+               << " relax=" << Fixup.isLinkerRelaxable() << " expr=";
         if (Fixup.getValue())
-          BC.AsmInfo->printExpr(BC.errs(), *Fixup.getValue());
+          BC.AsmInfo->printExpr(dbgs(), *Fixup.getValue());
         else
-          BC.errs() << "<null>";
-        BC.errs() << '\n';
-      }
+          dbgs() << "<null>";
+        dbgs() << '\n';
+      });
       std::optional<Relocation> Rel = BC.MIB->createRelocation(Fixup, *BC.MAB);
       if (!Rel) {
         Success = false;
@@ -1899,6 +1899,24 @@ bool BinaryFunction::scanExternalRefs() {
         if (!opts::CompactCodeModel)
           if (BinaryFunction *TargetBF = BC.getFunctionForSymbol(Rel->Symbol))
             TargetBF->setNeedsPatch(true);
+      }
+
+      if (BC.isRISCV()) {
+        switch (Rel->Type) {
+        default:
+          break;
+        case ELF::R_RISCV_JAL:
+        case ELF::R_RISCV_BRANCH:
+        case ELF::R_RISCV_RVC_JUMP:
+        case ELF::R_RISCV_RVC_BRANCH:
+          // These relocations encode short control-flow immediates. If the
+          // moved target is out of range, keep the original instruction and
+          // make the target function preserve an entry at the original address.
+          Rel->setOptional();
+          if (BinaryFunction *TargetBF = BC.getFunctionForSymbol(Rel->Symbol))
+            TargetBF->setNeedsPatch(true);
+          break;
+        }
       }
 
       Rel->Offset += getAddress() - getOriginSection()->getAddress() + Offset;

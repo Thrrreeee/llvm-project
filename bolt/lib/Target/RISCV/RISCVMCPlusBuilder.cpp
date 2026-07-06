@@ -346,6 +346,7 @@ public:
     default:
       return false;
     case RISCV::C_J:
+    case RISCV::PseudoCALL:
     case RISCV::PseudoTAIL:
       OpNum = 0;
       return true;
@@ -365,6 +366,37 @@ public:
       return true;
     }
   }
+
+  int getPCRelEncodingSize(const MCInst &Inst) const override {
+    switch (Inst.getOpcode()) {
+    default:
+      llvm_unreachable("Failed to get pcrel encoding size");
+      return 0;
+    case RISCV::JAL:
+      return 21;
+    case RISCV::PseudoCALL:
+    case RISCV::PseudoTAIL:
+      return 32;
+    case RISCV::BEQ:
+    case RISCV::BGE:
+    case RISCV::BGEU:
+    case RISCV::BNE:
+    case RISCV::BLT:
+    case RISCV::BLTU:
+      return 13;
+    case RISCV::C_J:
+      return 12;
+    case RISCV::C_BEQZ:
+    case RISCV::C_BNEZ:
+      return 9;
+    }
+  }
+
+  int getShortJmpEncodingSize() const override {
+    return regSize() * 8;
+  }
+
+  int getUncondBranchEncodingSize() const override { return 21; }
 
   const MCSymbol *getTargetSymbol(const MCExpr *Expr) const override {
     auto *RISCVExpr = dyn_cast<MCSpecifierExpr>(Expr);

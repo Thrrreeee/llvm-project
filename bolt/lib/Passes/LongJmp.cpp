@@ -700,9 +700,6 @@ void LongJmpPass::relaxLocalBranches(BinaryFunction &BF) {
     // Dynamically-updated size of the fragment.
     uint64_t FragmentSize = CodeSize;
 
-    // Size of the trampoline in bytes.
-    constexpr uint64_t TrampolineSize = 4;
-
     // Trampolines created for the fragment. DestinationBB -> TrampolineBB.
     // NB: here we store only the first trampoline created for DestinationBB.
     DenseMap<const BinaryBasicBlock *, BinaryBasicBlock *> FragmentTrampolines;
@@ -717,12 +714,14 @@ void LongJmpPass::relaxLocalBranches(BinaryFunction &BF) {
                                        BF.createBasicBlock());
       BinaryBasicBlock *TrampolineBB = FunctionTrampolines.back().second.get();
 
-      MCInst Inst;
+      InstructionListType Seq;
       {
         auto L = BC.scopeLock();
-        MIB->createUncondBranch(Inst, TargetBB->getLabel(), BC.Ctx.get());
+        MIB->createShortJmp(Seq, TargetBB->getLabel(), BC.Ctx.get());
       }
-      TrampolineBB->addInstruction(Inst);
+      const uint64_t TrampolineSize =
+          BC.computeCodeSize(Seq.begin(), Seq.end());
+      TrampolineBB->addInstructions(Seq.begin(), Seq.end());
       TrampolineBB->addSuccessor(TargetBB, Count);
       TrampolineBB->setExecutionCount(Count);
       const uint64_t TrampolineAddress =
@@ -749,7 +748,8 @@ void LongJmpPass::relaxLocalBranches(BinaryFunction &BF) {
         if (IBB->getOutputStartAddress() >= TrampolineAddress) {
           IBB->setOutputStartAddress(IBB->getOutputStartAddress() +
                                      TrampolineSize);
-          IBB->setOutputEndAddress(IBB->getOutputEndAddress() + TrampolineSize);
+          IBB->setOutputEndAddress(IBB->getOutputEndAddress() +
+                                   TrampolineSize);
         }
       }
 
@@ -766,7 +766,8 @@ void LongJmpPass::relaxLocalBranches(BinaryFunction &BF) {
         if (IBB->getOutputStartAddress() >= TrampolineAddress) {
           IBB->setOutputStartAddress(IBB->getOutputStartAddress() +
                                      TrampolineSize);
-          IBB->setOutputEndAddress(IBB->getOutputEndAddress() + TrampolineSize);
+          IBB->setOutputEndAddress(IBB->getOutputEndAddress() +
+                                   TrampolineSize);
         }
       }
 
@@ -781,11 +782,14 @@ void LongJmpPass::relaxLocalBranches(BinaryFunction &BF) {
         continue;
 
       const MCSymbol *TargetSymbol = MIB->getTargetSymbol(*Inst);
-      BB->eraseInstruction(BB->findInstruction(Inst));
-      BB->setOutputEndAddress(BB->getOutputEndAddress() - TrampolineSize);
-
       BinaryBasicBlock::BinaryBranchInfo BI;
       BinaryBasicBlock *TargetBB = BB->getSuccessor(TargetSymbol, BI);
+      if (!TargetBB)
+        continue;
+
+      const uint64_t BranchSize = BC.computeCodeSize(Inst, Inst + 1);
+      BB->eraseInstruction(BB->findInstruction(Inst));
+      BB->setOutputEndAddress(BB->getOutputEndAddress() - BranchSize);
 
       BinaryBasicBlock *TrampolineBB =
           addTrampolineAfter(BB, TargetBB, BI.Count, /*UpdateOffsets*/ false);
@@ -882,8 +886,8 @@ void LongJmpPass::relaxLocalBranches(BinaryFunction &BF) {
 
           const MCSymbol *TargetSymbol = MIB->getTargetSymbol(Inst);
           BinaryBasicBlock *TargetBB = BB->getSuccessor(TargetSymbol);
-          assert(TargetBB &&
-                 "Basic block target expected for conditional branch.");
+          if (!TargetBB)
+            continue;
 
           // Check if the relaxation is needed.
           if (TargetBB->getFragmentNum() == FF.getFragmentNum() &&
@@ -935,9 +939,11 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
           opts::SplitStrategy != opts::SplitFunctionsStrategy::CDSplit) &&
          "LongJmp cannot work with functions split in more than two fragments");
 
-  if (opts::CompactCodeModel) {
+  if (opts::CompactCodeModel || BC.isRISCV()) {
     BC.outs()
-        << "BOLT-INFO: relaxing branches for compact code model (<128MB)\n";
+        << "BOLT-INFO: relaxing local branches"
+        << (opts::CompactCodeModel ? " for compact code model (<128MB)" : "")
+        << "\n";
 
     ParallelUtilities::WorkFuncTy WorkFun = [&](BinaryFunction &BF) {
       relaxLocalBranches(BF);
@@ -945,7 +951,7 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
 
     ParallelUtilities::PredicateTy SkipPredicate =
         [&](const BinaryFunction &BF) {
-          return !BC.shouldEmit(BF) || !BF.isSimple();
+          return !BC.shouldEmit(BF) || (!BC.isRISCV() && !BF.isSimple());
         };
 
     ParallelUtilities::runOnEachFunction(

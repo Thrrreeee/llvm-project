@@ -1867,7 +1867,7 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
 
   MCSymbol *Symbol = Rel->Symbol;
   if (!Symbol) {
-    if (BC->isRISCV() || !Rel->Addend || !Rel->isIRelative())
+    if (!Rel->Addend || !Rel->isIRelative())
       return;
 
     // IFUNC trampoline without symbol
@@ -1891,6 +1891,23 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
   else
     BF->addAlternativeName(Symbol->getName().str() + "@PLT");
   setPLTSymbol(BF, Symbol->getName());
+
+  if (Rel->isIRelative()) {
+    auto ResolverSyms = FileSymRefs.equal_range(Rel->Addend);
+    for (const SymbolRef &AliasSymbol : llvm::make_second_range(
+             llvm::make_range(ResolverSyms.first, ResolverSyms.second))) {
+      if (ELFSymbolRef(AliasSymbol).getELFType() != ELF::STT_GNU_IFUNC)
+        continue;
+      StringRef AliasName = cantFail(AliasSymbol.getName());
+      const std::string PLTName = AliasName.str() + "@PLT";
+      if (!BC->getBinaryDataByName(PLTName)) {
+        BF->addAlternativeName(PLTName);
+        BC->registerNameAtAddress(PLTName, EntryAddress, 0, EntrySize,
+                                  Section->getAlignment());
+      }
+      setPLTSymbol(BF, AliasName);
+    }
+  }
 }
 
 void RewriteInstance::disassemblePLTInstruction(const BinarySection &Section,
@@ -1979,8 +1996,9 @@ void RewriteInstance::disassemblePLTSectionRISCV(BinarySection &Section) {
     }
   };
 
-  // Skip the first special entry since no relocation points to it.
-  uint64_t InstrOffset = 32;
+  // Regular .plt has a first special entry with no relocations pointing to it,
+  // while static IFUNC .iplt entries start at the beginning of the section.
+  uint64_t InstrOffset = Section.getName() == ".iplt" ? 0 : 32;
 
   while (InstrOffset < SectionSize) {
     InstructionListType Instructions;
@@ -2600,9 +2618,15 @@ bool RewriteInstance::analyzeRelocation(
     SkipVerification = (cantFail(Symbol.getType()) == SymbolRef::ST_Other);
     // Section symbols are marked as ST_Debug.
     IsSectionRelocation = (cantFail(Symbol.getType()) == SymbolRef::ST_Debug);
-    // Check for PLT entry registered with symbol name
-    if (!SymbolAddress && !IsWeakReference(Symbol) &&
-        (IsAArch64 || BC->isRISCV())) {
+    // Check for PLT entry registered with symbol name. R_RISCV_CALL_PLT should
+    // prefer the PLT entry when it exists even if the symbol has a resolver
+    // address, as in non-preemptible ifunc calls.
+    if (BC->isRISCV() && RType == ELF::R_RISCV_CALL_PLT &&
+        !IsWeakReference(Symbol)) {
+      if (const BinaryData *BD = BC->getPLTBinaryDataByName(SymbolName))
+        SymbolAddress = BD->getAddress();
+    } else if (!SymbolAddress && !IsWeakReference(Symbol) &&
+               (IsAArch64 || BC->isRISCV())) {
       const BinaryData *BD = BC->getPLTBinaryDataByName(SymbolName);
       SymbolAddress = BD ? BD->getAddress() : 0;
     }

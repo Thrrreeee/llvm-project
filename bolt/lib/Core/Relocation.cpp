@@ -128,6 +128,7 @@ static bool isSupportedRISCV(uint32_t Type) {
   case ELF::R_RISCV_TPREL_ADD:
   case ELF::R_RISCV_TPREL_LO12_I:
   case ELF::R_RISCV_TPREL_LO12_S:
+  case ELF::R_RISCV_IRELATIVE:
   case ELFReserved::R_RISCV_TPREL_I:
   case ELFReserved::R_RISCV_TPREL_S:
     return true;
@@ -235,6 +236,7 @@ static size_t getSizeForTypeRISCV(uint32_t Type) {
   case ELF::R_RISCV_32:
     return 4;
   case ELF::R_RISCV_64:
+  case ELF::R_RISCV_IRELATIVE:
   case ELF::R_RISCV_GOT_HI20:
   case ELF::R_RISCV_TLS_GOT_HI20:
   case ELF::R_RISCV_TLS_GD_HI20:
@@ -857,7 +859,7 @@ bool Relocation::isIRelative(uint32_t Type) {
     return Type == ELF::R_AARCH64_IRELATIVE;
   case Triple::riscv64:
   case Triple::riscv32:
-    llvm_unreachable("not implemented");
+    return Type == ELF::R_RISCV_IRELATIVE;
   case Triple::x86_64:
     return Type == ELF::R_X86_64_IRELATIVE;
   }

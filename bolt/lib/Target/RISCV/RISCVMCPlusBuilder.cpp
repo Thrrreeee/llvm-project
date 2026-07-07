@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "MCTargetDesc/RISCVMCAsmInfo.h"
 #include "MCTargetDesc/RISCVFixupKinds.h"
+#include "MCTargetDesc/RISCVMCAsmInfo.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "bolt/Core/MCPlusBuilder.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -896,7 +896,7 @@ public:
                            .addReg(RISCV::X5)
                            .addImm((Imm >> 12) & 0xFFFFF));
     Insts.emplace_back(
-        MCInstBuilder(RISCV::LUI).addReg(RISCV::X6).addImm((Imm)&0xFFF));
+        MCInstBuilder(RISCV::LUI).addReg(RISCV::X6).addImm((Imm) & 0xFFF));
     Insts.emplace_back(MCInstBuilder(RISCV::SRLI)
                            .addReg(RISCV::X6)
                            .addReg(RISCV::X6)

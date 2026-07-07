@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCAsmInfo.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "bolt/Core/MCPlusBuilder.h"
@@ -215,7 +216,7 @@ public:
 
     switch (Inst.getOpcode()) {
     default:
-      llvm_unreachable("unsupported tail call opcode");
+      return false;
     case RISCV::JAL:
     case RISCV::JALR:
     case RISCV::C_J:
@@ -224,6 +225,14 @@ public:
     }
 
     setTailCall(Inst);
+    return true;
+  }
+
+  bool convertTailCallToJmp(MCInst &Inst) override {
+    removeAnnotation(Inst, MCPlus::MCAnnotation::kTailCall);
+    clearOffset(Inst);
+    if (getConditionalTailCall(Inst))
+      unsetConditionalTailCall(Inst);
     return true;
   }
 
@@ -328,6 +337,8 @@ public:
     default:
       return false;
     case RISCV::C_J:
+    case RISCV::PseudoCALL:
+    case RISCV::PseudoTAIL:
       OpNum = 0;
       return true;
     case RISCV::AUIPC:
@@ -638,6 +649,73 @@ public:
     setOperandToSymbolRef(Insts[1], /* OpNum */ 2, AuipcLabel, Addend, Ctx,
                           ELF::R_RISCV_PCREL_LO12_I);
     return Insts;
+  }
+
+  std::optional<Relocation>
+  createRelocation(const MCFixup &Fixup,
+                   const MCAsmBackend &MAB) const override {
+    MCFixupKindInfo FKI = MAB.getFixupKindInfo(Fixup.getKind());
+    assert(FKI.TargetOffset == 0 && "0-bit relocation offset expected");
+    const uint64_t RelOffset = Fixup.getOffset();
+
+    uint32_t RelType;
+    if (Fixup.isPCRel()) {
+      switch (Fixup.getKind()) {
+      default:
+        return std::nullopt;
+      case FK_Data_4:
+        RelType = ELF::R_RISCV_32_PCREL;
+        break;
+      case RISCV::fixup_riscv_pcrel_hi20:
+        RelType = ELF::R_RISCV_PCREL_HI20;
+        break;
+      case RISCV::fixup_riscv_pcrel_lo12_i:
+        RelType = ELF::R_RISCV_PCREL_LO12_I;
+        break;
+      case RISCV::fixup_riscv_pcrel_lo12_s:
+        RelType = ELF::R_RISCV_PCREL_LO12_S;
+        break;
+      case RISCV::fixup_riscv_jal:
+        RelType = ELF::R_RISCV_JAL;
+        break;
+      case RISCV::fixup_riscv_branch:
+        RelType = ELF::R_RISCV_BRANCH;
+        break;
+      case RISCV::fixup_riscv_rvc_jump:
+        RelType = ELF::R_RISCV_RVC_JUMP;
+        break;
+      case RISCV::fixup_riscv_rvc_branch:
+        RelType = ELF::R_RISCV_RVC_BRANCH;
+        break;
+      case RISCV::fixup_riscv_call:
+      case RISCV::fixup_riscv_call_plt:
+        RelType = ELF::R_RISCV_CALL_PLT;
+        break;
+      }
+    } else {
+      switch (Fixup.getKind()) {
+      default:
+        return std::nullopt;
+      case FK_Data_4:
+        RelType = ELF::R_RISCV_32;
+        break;
+      case FK_Data_8:
+        RelType = ELF::R_RISCV_64;
+        break;
+      case RISCV::fixup_riscv_hi20:
+        RelType = ELF::R_RISCV_HI20;
+        break;
+      case RISCV::fixup_riscv_lo12_i:
+        RelType = ELF::R_RISCV_LO12_I;
+        break;
+      case RISCV::fixup_riscv_lo12_s:
+        RelType = ELF::R_RISCV_LO12_S;
+        break;
+      }
+    }
+
+    auto [RelSymbol, RelAddend] = extractFixupExpr(Fixup);
+    return Relocation({RelOffset, RelSymbol, RelType, RelAddend, 0});
   }
 
   InstructionListType createInstrIncMemory(const MCSymbol *Target,

@@ -1,3 +1,4 @@
+REQUIRES: system-linux, target=riscv64{{.*}}
 // With -O0 indirect call is performed on IPLT trampoline. IPLT trampoline
 // has IFUNC symbol.
 // RUN: %clang %cflags64 -Wl,-z,undefs -nostdlib -O0 -no-pie %p/../Inputs/ifunc.c -fuse-ld=lld \

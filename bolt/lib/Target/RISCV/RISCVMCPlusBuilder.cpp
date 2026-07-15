@@ -241,6 +241,29 @@ public:
     return {Inst};
   }
 
+  int getPCRelEncodingSize(const MCInst &Inst) const override {
+    switch (Inst.getOpcode()) {
+    default:
+      llvm_unreachable("Failed to get RISC-V PC-relative encoding size");
+    case RISCV::C_BEQZ:
+    case RISCV::C_BNEZ:
+      return 9;
+    case RISCV::C_J:
+      return 12;
+    case RISCV::BEQ:
+    case RISCV::BNE:
+    case RISCV::BLT:
+    case RISCV::BGE:
+    case RISCV::BLTU:
+    case RISCV::BGEU:
+      return 13;
+    case RISCV::JAL:
+      return 21;
+    }
+  }
+
+  int getUncondBranchEncodingSize() const override { return 21; }
+
   void replaceBranchTarget(MCInst &Inst, const MCSymbol *TBB,
                            MCContext *Ctx) const override {
     assert((isCall(Inst) || isBranch(Inst)) && !isIndirectBranch(Inst) &&
@@ -759,6 +782,29 @@ public:
     if (IsTailCall)
       setTailCall(Inst);
     Seq.swap(Insts);
+  }
+
+  void createLongJmp(InstructionListType &Seq, const MCSymbol *Target,
+                     MCContext *Ctx, bool IsTailCall,
+                     MCPhysReg ScratchReg) override {
+    assert(ScratchReg && "RISC-V long jump requires a scratch register");
+    MCSymbol *AuipcLabel = Ctx->createNamedTempSymbol("long_jmp");
+
+    MCInst Inst = MCInstBuilder(RISCV::AUIPC).addReg(ScratchReg).addImm(0);
+    setOperandToSymbolRef(Inst, /*OpNum=*/1, Target, /*Addend=*/0, Ctx,
+                          ELF::R_RISCV_PCREL_HI20);
+    setInstLabel(Inst, AuipcLabel);
+    Seq.emplace_back(std::move(Inst));
+
+    Inst = MCInstBuilder(RISCV::JALR)
+               .addReg(RISCV::X0)
+               .addReg(ScratchReg)
+               .addImm(0);
+    setOperandToSymbolRef(Inst, /*OpNum=*/2, AuipcLabel, /*Addend=*/0, Ctx,
+                          ELF::R_RISCV_PCREL_LO12_I);
+    if (IsTailCall)
+      setTailCall(Inst);
+    Seq.emplace_back(std::move(Inst));
   }
 
   InstructionListType createGetter(MCContext *Ctx, const char *name) const {

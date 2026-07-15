@@ -1391,6 +1391,30 @@ void RewriteInstance::discoverFileObjects() {
   adjustFunctionBoundaries(MarkerSymbols);
   splitUnmarkedTailFunctions(MarkerSymbols);
 
+  // R_RISCV_IRELATIVE addends name resolver entry points. LLD may
+  // canonicalize the only IFUNC symbol to the IPLT entry, leaving the resolver
+  // without a symbol. Function sizes are not final when dynamic relocations
+  // are first read, so record these secondary entries after boundary
+  // adjustment.
+  if (BC->isRISCV()) {
+    for (const BinarySection &Section : BC->allocatableSections()) {
+      for (const Relocation &Rel : Section.dynamicRelocations()) {
+        if (!Rel.isIRelative() || !Rel.Addend)
+          continue;
+        BinaryFunction *BF = BC->getBinaryFunctionContainingAddress(Rel.Addend);
+        if (!BF || BF->getAddress() == Rel.Addend)
+          continue;
+        if (BF->isInConstantIsland(Rel.Addend)) {
+          BC->errs() << "BOLT-ERROR: IFUNC resolver at 0x"
+                     << Twine::utohexstr(Rel.Addend)
+                     << " is in constant island of function " << *BF << '\n';
+          exit(1);
+        }
+        BF->addEntryPointAtOffset(Rel.Addend - BF->getAddress());
+      }
+    }
+  }
+
   // Annotate functions with code/data markers in AArch64
   for (auto &[Address, Type] : MarkerSymbols) {
     auto *BF = BC->getBinaryFunctionContainingAddress(Address,
@@ -1886,7 +1910,7 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
 
   MCSymbol *Symbol = Rel->Symbol;
   if (!Symbol) {
-    if (BC->isRISCV() || !Rel->Addend || !Rel->isIRelative())
+    if (!Rel->Addend || !Rel->isIRelative())
       return;
 
     // IFUNC trampoline without symbol
@@ -1910,6 +1934,23 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
   else
     BF->addAlternativeName(Symbol->getName().str() + "@PLT");
   setPLTSymbol(BF, Symbol->getName());
+
+  if (Rel->isIRelative()) {
+    auto ResolverSyms = FileSymRefs.equal_range(Rel->Addend);
+    for (const SymbolRef &AliasSymbol : llvm::make_second_range(
+             llvm::make_range(ResolverSyms.first, ResolverSyms.second))) {
+      if (ELFSymbolRef(AliasSymbol).getELFType() != ELF::STT_GNU_IFUNC)
+        continue;
+      StringRef AliasName = cantFail(AliasSymbol.getName());
+      const std::string PLTName = AliasName.str() + "@PLT";
+      if (!BC->getBinaryDataByName(PLTName)) {
+        BF->addAlternativeName(PLTName);
+        BC->registerNameAtAddress(PLTName, EntryAddress, 0, EntrySize,
+                                  Section->getAlignment());
+      }
+      setPLTSymbol(BF, AliasName);
+    }
+  }
 }
 
 void RewriteInstance::disassemblePLTInstruction(const BinarySection &Section,
@@ -1998,8 +2039,9 @@ void RewriteInstance::disassemblePLTSectionRISCV(BinarySection &Section) {
     }
   };
 
-  // Skip the first special entry since no relocation points to it.
-  uint64_t InstrOffset = 32;
+  // Regular .plt has a first special entry with no relocations pointing to it,
+  // while static IFUNC .iplt entries start at the beginning of the section.
+  uint64_t InstrOffset = Section.getName() == ".iplt" ? 0 : 32;
 
   while (InstrOffset < SectionSize) {
     InstructionListType Instructions;
@@ -2808,7 +2850,10 @@ bool RewriteInstance::analyzeRelocation(
     // Section symbols are marked as ST_Debug.
     IsSectionRelocation = (cantFail(Symbol.getType()) == SymbolRef::ST_Debug);
     // Check for PLT entry registered with symbol name
-    if (!SymbolAddress && !IsWeakReference(Symbol) &&
+    const bool IsRISCVIFuncPLT =
+        BC->isRISCV() && RType == ELF::R_RISCV_CALL_PLT &&
+        ELFSymbolRef(Symbol).getELFType() == ELF::STT_GNU_IFUNC;
+    if ((!SymbolAddress || IsRISCVIFuncPLT) && !IsWeakReference(Symbol) &&
         (IsAArch64 || BC->isRISCV())) {
       const BinaryData *BD = BC->getPLTBinaryDataByName(SymbolName);
       SymbolAddress = BD ? BD->getAddress() : 0;

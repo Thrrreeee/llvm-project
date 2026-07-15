@@ -203,14 +203,20 @@ void BinarySection::flushPendingRelocations(raw_fd_ostream &OS,
     }
 
     uint32_t OriginalInst = 0;
-    // Are we dealing with B.cond, TBZ/TBNZ, CBZ/CBNZ and need extra info
-    // to be able to encode the instruction.
-    if (BC.isAArch64() && (Reloc.Type == ELF::R_AARCH64_CONDBR19 ||
-                           Reloc.Type == ELF::R_AARCH64_TSTBR14)) {
+    // Preserve the non-immediate bits when rewriting instruction relocations.
+    if ((BC.isAArch64() && (Reloc.Type == ELF::R_AARCH64_CONDBR19 ||
+                            Reloc.Type == ELF::R_AARCH64_TSTBR14)) ||
+        (BC.isRISCV() && (Reloc.Type == ELF::R_RISCV_BRANCH ||
+                         Reloc.Type == ELF::R_RISCV_JAL ||
+                         Reloc.Type == ELF::R_RISCV_RVC_BRANCH ||
+                         Reloc.Type == ELF::R_RISCV_RVC_JUMP))) {
       StringRef Contents = getContents();
-      assert(Contents.size() >= Reloc.Offset + 4 &&
+      const size_t Size = RH.getSizeForType(Reloc.Type);
+      assert(Contents.size() >= Reloc.Offset + Size &&
              "Complete instruction must lie in contents.");
-      OriginalInst = support::endian::read32le(Contents.data() + Reloc.Offset);
+      const char *Data = Contents.data() + Reloc.Offset;
+      OriginalInst = Size == 2 ? support::endian::read16le(Data)
+                               : support::endian::read32le(Data);
     }
     Value = RH.encodeValue(Reloc.Type, Value, SectionAddress + Reloc.Offset,
                            OriginalInst);

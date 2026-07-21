@@ -16,6 +16,7 @@
 # CHECK: Disassembly of section .text.cold:
 # CHECK-LABEL: <secondary>:
 # SYMBOLS: FUNC GLOBAL DEFAULT {{[0-9]+}} secondary
+# SYMBOLS-NOT: $x{{.*}}.cold
 
   .text
   .globl _start

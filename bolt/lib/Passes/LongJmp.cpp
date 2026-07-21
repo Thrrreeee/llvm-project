@@ -719,16 +719,17 @@ bool LongJmpPass::relaxLocalBranches(BinaryFunction &BF,
 
       BitVector Written(NumRegs, false);
       BitVector Used(NumRegs, false);
+      MIB->getWrittenRegs(Inst, Written);
+      MIB->getUsedRegs(Inst, Used);
       if (MIB->isCall(Inst)) {
-        MIB->getGPRegs(Written, /*IncludeAlias=*/true);
+        BitVector CallClobbered(NumRegs, false);
+        MIB->getGPRegs(CallClobbered, /*IncludeAlias=*/true);
         BitVector Preserved(NumRegs, false);
         MIB->getCalleeSavedRegs(Preserved);
         Preserved.flip();
-        Written &= Preserved;
+        CallClobbered &= Preserved;
+        Written |= CallClobbered;
         Used |= MIB->getRegsUsedAsParams();
-      } else {
-        MIB->getWrittenRegs(Inst, Written);
-        MIB->getUsedRegs(Inst, Used);
       }
       Written.flip();
       State &= Written;

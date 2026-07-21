@@ -449,6 +449,12 @@ RewriteInstance::RewriteInstance(ELFObjectFileBase *File, const int Argc,
       return;
     } else {
       Features.reset(new SubtargetFeatures(*FeaturesOrErr));
+      // EF_RISCV_RVE selects the E ABI even when the input has no
+      // .riscv.attributes architecture string. ObjectFile::getFeatures()
+      // currently derives RVC from e_flags but not RVE, so preserve this ABI
+      // constraint explicitly for register analysis and code generation.
+      if (File->getPlatformFlags() & ELF::EF_RISCV_RVE)
+        Features->AddFeature("e");
     }
   }
 

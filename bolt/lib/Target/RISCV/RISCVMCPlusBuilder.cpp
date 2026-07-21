@@ -31,6 +31,7 @@ namespace {
 
 class RISCVMCPlusBuilder : public MCPlusBuilder {
   bool isRV64() const { return STI->hasFeature(RISCV::Feature64Bit); }
+  bool isRVE() const { return STI->hasFeature(RISCV::FeatureStdExtE); }
   unsigned regSize() const { return isRV64() ? 8 : 4; }
   unsigned loadOpc() const { return isRV64() ? RISCV::LD : RISCV::LW; }
   unsigned storeOpc() const { return isRV64() ? RISCV::SD : RISCV::SW; }
@@ -43,7 +44,8 @@ public:
 
   BitVector getRegsUsedAsParams() const override {
     BitVector Regs(RegInfo->getNumRegs(), false);
-    for (MCPhysReg Reg = RISCV::X10; Reg <= RISCV::X17; ++Reg)
+    const MCPhysReg LastArgReg = isRVE() ? RISCV::X15 : RISCV::X17;
+    for (MCPhysReg Reg = RISCV::X10; Reg <= LastArgReg; ++Reg)
       Regs |= getAliases(Reg);
     return Regs;
   }
@@ -69,6 +71,8 @@ public:
     Regs |= getAliases(RISCV::X2);
     Regs |= getAliases(RISCV::X8);
     Regs |= getAliases(RISCV::X9);
+    if (isRVE())
+      return;
     Regs |= getAliases(RISCV::X18);
     Regs |= getAliases(RISCV::X19);
     Regs |= getAliases(RISCV::X20);
@@ -87,7 +91,8 @@ public:
   }
 
   void getGPRegs(BitVector &Regs, bool IncludeAlias = true) const override {
-    for (MCPhysReg Reg = RISCV::X1; Reg <= RISCV::X31; ++Reg) {
+    const MCPhysReg LastGPR = isRVE() ? RISCV::X15 : RISCV::X31;
+    for (MCPhysReg Reg = RISCV::X1; Reg <= LastGPR; ++Reg) {
       if (IncludeAlias)
         Regs |= getAliases(Reg);
       else

@@ -14,6 +14,12 @@
 # RUN:   -split-strategy=random2 -bolt-seed=1
 # RUN: llvm-objdump -d %t.32.bolt | FileCheck %s
 # RUN: llvm-readelf -s %t.32.bolt | FileCheck --check-prefix=SYMBOLS %s
+# RUN: llvm-mc -triple riscv32 -mattr=+e -filetype=obj -o %t.e.o %s
+# RUN: ld.lld --emit-relocs -e _start -o %t.e.exe %t.e.o
+# RUN: llvm-bolt %t.e.exe -o %t.e.bolt -split-functions \
+# RUN:   -split-strategy=random2 -bolt-seed=1
+# RUN: llvm-objdump -d %t.e.bolt 2>&1 | FileCheck %s
+# RUN: llvm-readelf -s %t.e.bolt | FileCheck --check-prefix=SYMBOLS %s
 
 # CHECK: Disassembly of section .text:
 # CHECK-LABEL: <_start>:

@@ -6630,6 +6630,29 @@ uint64_t RewriteInstance::getNewFunctionAddress(uint64_t OldAddress) {
 }
 
 uint64_t RewriteInstance::getNewFunctionOrDataAddress(uint64_t OldAddress) {
+  // Resolve secondary function entry points before the exact-address lookup.
+  // getBinaryFunctionAtAddress() can map a BinaryData symbol at a secondary
+  // entry back to its parent function and would then return the parent's main
+  // output address, losing the entry-point offset.
+  if (const BinaryFunction *BF =
+          BC->getBinaryFunctionContainingAddress(OldAddress)) {
+    if (BF->isEmitted() && BF->isMultiEntry()) {
+      uint64_t EntryAddress = 0;
+      BF->forEachEntryPoint([&](uint64_t Offset, const MCSymbol *Symbol) {
+        if (Offset && BF->getAddress() + Offset == OldAddress) {
+          if (auto SymbolInfo = Linker->lookupSymbolInfo(Symbol->getName()))
+            EntryAddress = SymbolInfo->Address;
+          else
+            EntryAddress = BF->translateInputToOutputAddress(OldAddress);
+          return false;
+        }
+        return true;
+      });
+      if (EntryAddress)
+        return EntryAddress;
+    }
+  }
+
   if (uint64_t Function = getNewFunctionAddress(OldAddress))
     return Function;
 

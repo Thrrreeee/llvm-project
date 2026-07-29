@@ -558,7 +558,8 @@ private:
       {".plt"}, {".plt.got"}, {".iplt"}, {nullptr}};
 
   /// RISCV PLT sections.
-  const PLTSectionInfo RISCV_PLTSections[2] = {{".plt"}, {nullptr}};
+  const PLTSectionInfo RISCV_PLTSections[3] = {{".plt"}, {".iplt", 16},
+                                               {nullptr}};
 
   /// Return PLT information for a section with \p SectionName or nullptr
   /// if the section is not PLT.
@@ -573,6 +574,7 @@ private:
     case Triple::aarch64:
       PLTSI = AArch64_PLTSections;
       break;
+    case Triple::riscv32:
     case Triple::riscv64:
       PLTSI = RISCV_PLTSections;
       break;

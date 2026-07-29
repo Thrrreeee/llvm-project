@@ -1875,7 +1875,7 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
 
   MCSymbol *Symbol = Rel->Symbol;
   if (!Symbol) {
-    if (BC->isRISCV() || !Rel->Addend || !Rel->isIRelative())
+    if (!Rel->Addend || !Rel->isIRelative())
       return;
 
     // IFUNC trampoline without symbol
@@ -1899,6 +1899,7 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
   else
     BF->addAlternativeName(Symbol->getName().str() + "@PLT");
   setPLTSymbol(BF, Symbol->getName());
+
 }
 
 void RewriteInstance::disassemblePLTInstruction(const BinarySection &Section,
@@ -1987,8 +1988,9 @@ void RewriteInstance::disassemblePLTSectionRISCV(BinarySection &Section) {
     }
   };
 
-  // Skip the first special entry since no relocation points to it.
-  uint64_t InstrOffset = 32;
+  // Regular .plt has a first special entry with no relocations pointing to it,
+  // while static IFUNC .iplt entries start at the beginning of the section.
+  uint64_t InstrOffset = Section.getName() == ".iplt" ? 0 : 32;
 
   while (InstrOffset < SectionSize) {
     InstructionListType Instructions;

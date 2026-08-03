@@ -283,6 +283,35 @@ class RISCVMCPlusBuilder : public MCPlusBuilder {
     return getTargetSymbolInfo(LHS) == getTargetSymbolInfo(RHS);
   }
 
+  bool replaceJumpTableSymbol(MCInst &Inst, const MCSymbol *OldTarget,
+                              const MCSymbol *NewTarget,
+                              MCContext *Ctx) const {
+    for (unsigned OpIndex = 0;
+         OpIndex < MCPlus::getNumPrimeOperands(Inst); ++OpIndex) {
+      MCOperand &Operand = Inst.getOperand(OpIndex);
+      if (!Operand.isExpr())
+        continue;
+
+      const MCExpr *Expr = Operand.getExpr();
+      const auto *Specifier = dyn_cast<MCSpecifierExpr>(Expr);
+      const MCExpr *SubExpr = Specifier ? Specifier->getSubExpr() : Expr;
+      const auto [Symbol, Addend] = getTargetSymbolInfo(SubExpr);
+      if (Symbol != OldTarget)
+        continue;
+
+      const MCExpr *NewExpr = MCSymbolRefExpr::create(NewTarget, *Ctx);
+      if (Addend)
+        NewExpr = MCBinaryExpr::createAdd(
+            NewExpr, MCConstantExpr::create(Addend, *Ctx), *Ctx);
+      if (Specifier)
+        NewExpr =
+            MCSpecifierExpr::create(NewExpr, Specifier->getSpecifier(), *Ctx);
+      Operand = MCOperand::createExpr(NewExpr);
+      return true;
+    }
+    return false;
+  }
+
 public:
   using MCPlusBuilder::MCPlusBuilder;
 
@@ -633,6 +662,24 @@ public:
     EntrySize = Load.EntrySize;
     EntrySigned = Load.EntrySigned;
     return IndirectBranchType::POSSIBLE_JUMP_TABLE;
+  }
+
+  bool replaceJumpTableReference(
+      MutableArrayRef<MCInst> InstrWindow, const MCSymbol *OldTarget,
+      const MCSymbol *NewTarget, MCContext *Ctx) const override {
+    for (MCInst &Inst : llvm::reverse(InstrWindow)) {
+      switch (Inst.getOpcode()) {
+      default:
+        continue;
+      case RISCV::AUIPC:
+      case RISCV::LUI:
+      case RISCV::C_LUI:
+        break;
+      }
+      if (replaceJumpTableSymbol(Inst, OldTarget, NewTarget, Ctx))
+        return true;
+    }
+    return false;
   }
 
   bool convertJmpToTailCall(MCInst &Inst) override {

@@ -43,6 +43,7 @@ public:
   uint32_t getNone() const override;
   uint32_t getPC32() const override;
   uint32_t getPC64() const override;
+  uint32_t getAbs32() const override;
   uint32_t getAbs64() const override;
   uint32_t getRelative() const override;
 
@@ -68,6 +69,10 @@ uint32_t X86RelocationHandler::getNone() const { return ELF::R_X86_64_NONE; }
 uint32_t X86RelocationHandler::getPC32() const { return ELF::R_X86_64_PC32; }
 
 uint32_t X86RelocationHandler::getPC64() const { return ELF::R_X86_64_PC64; }
+
+uint32_t X86RelocationHandler::getAbs32() const {
+  return ELF::R_X86_64_32;
+}
 
 uint32_t X86RelocationHandler::getAbs64() const { return ELF::R_X86_64_64; }
 

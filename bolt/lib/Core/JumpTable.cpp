@@ -13,6 +13,7 @@
 #include "bolt/Core/JumpTable.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Core/BinarySection.h"
+#include "bolt/Core/Relocation.h"
 #include "llvm/Support/CommandLine.h"
 
 #define DEBUG_TYPE "bolt"
@@ -28,10 +29,11 @@ extern cl::opt<unsigned> Verbosity;
 } // namespace opts
 
 bolt::JumpTable::JumpTable(MCSymbol &Symbol, uint64_t Address, size_t EntrySize,
-                           JumpTableType Type, LabelMapType &&Labels,
-                           BinarySection &Section)
+                           bool EntriesAreSigned, JumpTableType Type,
+                           LabelMapType &&Labels, BinarySection &Section)
     : BinaryData(Symbol, Address, 0, EntrySize, Section), EntrySize(EntrySize),
-      OutputEntrySize(EntrySize), Type(Type), Labels(Labels) {}
+      OutputEntrySize(EntrySize), Type(Type),
+      EntriesAreSigned(EntriesAreSigned), Labels(Labels) {}
 
 std::pair<size_t, size_t>
 bolt::JumpTable::getEntriesForAddress(const uint64_t Addr) const {
@@ -81,11 +83,15 @@ bool bolt::JumpTable::replaceDestination(uint64_t JTAddress,
 
 void bolt::JumpTable::updateOriginal() {
   BinaryContext &BC = getSection().getBinaryContext();
+  const RelocationHandler &RH = BC.getRelocationHandler();
   const uint64_t BaseOffset = getAddress() - getSection().getAddress();
   uint64_t EntryOffset = BaseOffset;
   for (MCSymbol *Entry : Entries) {
-    const uint32_t RelType =
-        Type == JTT_NORMAL ? ELF::R_X86_64_64 : ELF::R_X86_64_PC32;
+    assert((Type == JTT_PIC || EntrySize == 4 || EntrySize == 8) &&
+           "unsupported absolute jump-table entry size");
+    const uint32_t RelType = Type == JTT_PIC  ? RH.getPC32()
+                             : EntrySize == 4 ? RH.getAbs32()
+                                              : RH.getAbs64();
     const uint64_t RelAddend =
         Type == JTT_NORMAL ? 0 : EntryOffset - BaseOffset;
     // Replace existing relocation with the new one to allow any modifications

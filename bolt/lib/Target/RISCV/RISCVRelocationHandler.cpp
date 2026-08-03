@@ -55,6 +55,7 @@ public:
   uint32_t getNone() const override;
   uint32_t getPC32() const override;
   uint32_t getPC64() const override;
+  uint32_t getAbs32() const override;
   uint32_t getAbs64() const override;
   uint32_t getRelative() const override;
 
@@ -86,6 +87,10 @@ uint32_t RISCVRelocationHandler::getPC32() const {
 
 uint32_t RISCVRelocationHandler::getPC64() const {
   llvm_unreachable("not implemented");
+}
+
+uint32_t RISCVRelocationHandler::getAbs32() const {
+  return ELF::R_RISCV_32;
 }
 
 uint32_t RISCVRelocationHandler::getAbs64() const { return ELF::R_RISCV_64; }

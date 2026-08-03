@@ -96,6 +96,9 @@ public:
   /// Return true if relocation type is PC-relative. Return false otherwise.
   virtual bool isPCRelative(uint32_t Type) const = 0;
 
+  /// Return code for an ABS 4-byte relocation
+  virtual uint32_t getAbs32() const = 0;
+
   /// Return code for a ABS 8-byte relocation
   virtual uint32_t getAbs64() const = 0;
 

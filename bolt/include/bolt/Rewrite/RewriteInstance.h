@@ -543,6 +543,9 @@ private:
   std::optional<uint64_t> PLTRelocationsAddress;
   uint64_t PLTRelocationsSize{0};
 
+  /// True if a static RISC-V PLT was found through .rela.plt.
+  bool HasStaticRISCVPLT{false};
+
   /// True if relocation of specified type came from .rela.plt
   DenseMap<uint64_t, bool> IsJmpRelocation;
 

@@ -2042,8 +2042,10 @@ void RewriteInstance::disassemblePLTSectionRISCV(BinarySection &Section) {
   };
 
   // A regular .plt has a first special entry with no relocations pointing to
-  // it, while all .iplt sections are headerless.
-  uint64_t InstrOffset = Section.getName() == ".iplt" ? 0 : 32;
+  // it. GNU ld's static IFUNC .plt and all .iplt sections are headerless.
+  const bool IsHeaderless = Section.getName() == ".iplt" ||
+                            (Section.getName() == ".plt" && HasStaticRISCVPLT);
+  uint64_t InstrOffset = IsHeaderless ? 0 : 32;
 
   while (InstrOffset < SectionSize) {
     InstructionListType Instructions;
@@ -2929,6 +2931,19 @@ bool RewriteInstance::analyzeRelocation(
 }
 
 void RewriteInstance::processDynamicRelocations() {
+  // A static RISC-V executable linked by GNU ld can have no PT_DYNAMIC and
+  // keep its IRELATIVE relocations in .rela.plt.
+  if (BC->TheTriple->isRISCV64() && BC->IsStaticExecutable &&
+      !PLTRelocationsSize) {
+    ErrorOr<BinarySection &> PLTRelSectionOrErr =
+        BC->getUniqueSectionByName(".rela.plt");
+    if (PLTRelSectionOrErr) {
+      PLTRelocationsAddress = PLTRelSectionOrErr->getAddress();
+      PLTRelocationsSize = PLTRelSectionOrErr->getSize();
+      HasStaticRISCVPLT = true;
+    }
+  }
+
   // Read .relr.dyn section containing compressed R_*_RELATIVE relocations.
   if (DynamicRelrSize > 0) {
     ErrorOr<BinarySection &> DynamicRelrSectionOrErr =

@@ -1,0 +1,15 @@
+## Check the static IFUNC layout emitted by GNU ld: R_RISCV_IRELATIVE is in
+## .rela.plt and the headerless IFUNC entries are in .plt rather than .iplt.
+
+# RUN: yaml2obj %p/Inputs/ifunc-gnu-ld.yaml -o %t
+# RUN: llvm-bolt %t -o %t.bolt --use-old-text=0 --lite=0 \
+# RUN:   --print-disasm --print-only=_start 2>&1 | FileCheck %s \
+# RUN:   --check-prefix=BOLT \
+# RUN:   --implicit-check-not="Expected BF to be presented as IFUNC resolver"
+# RUN: llvm-readelf -Wr -Ws %t.bolt | FileCheck %s --check-prefix=ELF
+
+# BOLT: Binary Function "_start
+# BOLT: auipc ra, ifunc0@PLT
+
+# ELF: R_RISCV_IRELATIVE {{ *}}[[#%x,RESOLVER:]]
+# ELF: {{0*}}[[#%x,RESOLVER]] 4 IFUNC {{.*}} ifunc0

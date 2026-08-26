@@ -1,0 +1,160 @@
+## Generated from the following source using llvm-mc and
+## riscv64-linux-gnu-ld -q:
+##
+##   .text
+##   .globl _start
+##   .type _start, @function
+## _start:
+##   call ifunc0
+##
+##   .globl func
+##   .type func, @function
+## func:
+##   ret
+##
+##   .globl ifunc0
+##   .type ifunc0, @gnu_indirect_function
+## ifunc0:
+##   ret
+
+--- !ELF
+FileHeader:
+  Class:           ELFCLASS64
+  Data:            ELFDATA2LSB
+  OSABI:           ELFOSABI_GNU
+  Type:            ET_EXEC
+  Machine:         EM_RISCV
+  Entry:           0x100E0
+ProgramHeaders:
+  - Type:            PT_LOAD
+    Flags:           [ PF_X, PF_R ]
+    FirstSec:        .rela.plt
+    LastSec:         .text
+    VAddr:           0x10000
+    Align:           0x10000
+    Offset:          0x0
+  - Type:            PT_LOAD
+    Flags:           [ PF_W, PF_R ]
+    FirstSec:        .got.plt
+    LastSec:         .got.plt
+    VAddr:           0x200F0
+    Align:           0x10000
+    Offset:          0xF0
+Sections:
+  - Name:            .rela.plt
+    Type:            SHT_RELA
+    Flags:           [ SHF_ALLOC, SHF_INFO_LINK ]
+    Address:         0x100B0
+    AddressAlign:    0x8
+    Info:            .got.plt
+    Relocations:
+      - Offset:          0x200F0
+        Type:            R_RISCV_IRELATIVE
+        Addend:          65772
+  - Name:            .plt
+    Type:            SHT_PROGBITS
+    Flags:           [ SHF_ALLOC, SHF_EXECINSTR ]
+    Address:         0x100D0
+    AddressAlign:    0x10
+    Content:         170E0100033E0E0267030E0013000000
+  - Name:            .text
+    Type:            SHT_PROGBITS
+    Flags:           [ SHF_ALLOC, SHF_EXECINSTR ]
+    Address:         0x100E0
+    AddressAlign:    0x4
+    Content:         97000000E78000FF6780000067800000
+  - Name:            .got.plt
+    Type:            SHT_PROGBITS
+    Flags:           [ SHF_WRITE, SHF_ALLOC ]
+    Address:         0x200F0
+    AddressAlign:    0x8
+    Content:         D000010000000000
+  - Name:            .rela.text
+    Type:            SHT_RELA
+    Flags:           [ SHF_INFO_LINK ]
+    Link:            .symtab
+    AddressAlign:    0x8
+    Info:            .text
+    Relocations:
+      - Offset:          0x100E0
+        Symbol:          ifunc0
+        Type:            R_RISCV_CALL_PLT
+      - Offset:          0x100E0
+        Type:            R_RISCV_RELAX
+  - Type:            SectionHeaderTable
+    Sections:
+      - Name:            .rela.plt
+      - Name:            .plt
+      - Name:            .text
+      - Name:            .rela.text
+      - Name:            .got.plt
+      - Name:            .symtab
+      - Name:            .strtab
+      - Name:            .shstrtab
+Symbols:
+  - Name:            .rela.plt
+    Type:            STT_SECTION
+    Section:         .rela.plt
+    Value:           0x100B0
+  - Name:            .plt
+    Type:            STT_SECTION
+    Section:         .plt
+    Value:           0x100D0
+  - Name:            .text
+    Type:            STT_SECTION
+    Section:         .text
+    Value:           0x100E0
+  - Name:            .got.plt
+    Type:            STT_SECTION
+    Section:         .got.plt
+    Value:           0x200F0
+  - Name:            ifunc.o
+    Type:            STT_FILE
+    Index:           SHN_ABS
+  - Name:            '$xrv64i2p1'
+    Section:         .text
+    Value:           0x100E0
+  - Name:            '__global_pointer$'
+    Index:           SHN_ABS
+    Binding:         STB_GLOBAL
+    Value:           0x208F8
+  - Name:            __SDATA_BEGIN__
+    Section:         .got.plt
+    Binding:         STB_GLOBAL
+    Value:           0x200F8
+  - Name:            ifunc0
+    Type:            STT_GNU_IFUNC
+    Section:         .text
+    Binding:         STB_GLOBAL
+    Value:           0x100EC
+  - Name:            _start
+    Type:            STT_FUNC
+    Section:         .text
+    Binding:         STB_GLOBAL
+    Value:           0x100E0
+  - Name:            __BSS_END__
+    Section:         .got.plt
+    Binding:         STB_GLOBAL
+    Value:           0x200F8
+  - Name:            __bss_start
+    Section:         .got.plt
+    Binding:         STB_GLOBAL
+    Value:           0x200F8
+  - Name:            func
+    Type:            STT_FUNC
+    Section:         .text
+    Binding:         STB_GLOBAL
+    Value:           0x100E8
+  - Name:            __DATA_BEGIN__
+    Section:         .got.plt
+    Binding:         STB_GLOBAL
+    Value:           0x200F8
+  - Name:            _edata
+    Section:         .got.plt
+    Binding:         STB_GLOBAL
+    Value:           0x200F8
+  - Name:            _end
+    Section:         .got.plt
+    Binding:         STB_GLOBAL
+    Value:           0x200F8
+...

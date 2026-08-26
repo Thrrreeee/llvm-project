@@ -16,6 +16,18 @@
 # RUN: FileCheck %s --input-file=%t.64.dump \
 # RUN:   --check-prefixes=ELF,IPLT,RESOLVER
 
+# RUN: llvm-mc -filetype=obj -triple=riscv32 -mattr=+relax -o %t.32.o %s
+# RUN: ld.lld -q -o %t.32 %t.32.o
+# RUN: llvm-objcopy --discard-all %t.32
+# RUN: llvm-bolt %t.32 -o %t.32.bolt --use-old-text=0 --lite=0 \
+# RUN:   --print-disasm --print-only=_start 2>&1 | FileCheck %s \
+# RUN:   --check-prefix=BOLT \
+# RUN:   --implicit-check-not="Expected BF to be presented as IFUNC resolver"
+# RUN: llvm-readelf -Wr -Ws %t.32.bolt > %t.32.dump
+# RUN: llvm-objdump -d --no-show-raw-insn %t.32.bolt >> %t.32.dump
+# RUN: FileCheck %s --input-file=%t.32.dump \
+# RUN:   --check-prefixes=ELF,IPLT,RESOLVER
+
 # BOLT: Binary Function "_start
 # BOLT: auipc a0, %pcrel_hi(__BOLT_IFUNC_RESOLVERat{{[0-9a-f]+}}@PLT)
 
@@ -25,7 +37,7 @@
 # IPLT: Disassembly of section .iplt:
 # IPLT: <ifunc0>:
 # IPLT-NEXT: {{.*}} auipc t3,
-# IPLT-NEXT: {{.*}} ld t3,
+# IPLT-NEXT: {{.*}} l{{[dw]}} t3,
 
 # RESOLVER: {{^ *}}[[#%x,RESOLVER]]:{{ *}}ret
 

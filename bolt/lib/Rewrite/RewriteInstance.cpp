@@ -1354,7 +1354,7 @@ void RewriteInstance::discoverFileObjects() {
   processDynamicRelocations();
 
   SmallVector<uint64_t, 1> RISCVIFUNCResolvers;
-  if (BC->TheTriple->isRISCV64()) {
+  if (BC->isRISCV()) {
     for (const BinarySection &Section : BC->allocatableSections())
       for (const Relocation &Rel : Section.dynamicRelocations())
         if (Rel.isIRelative() && Rel.Addend)
@@ -1428,14 +1428,14 @@ void RewriteInstance::discoverFileObjects() {
   adjustFunctionBoundaries(MarkerSymbols);
   splitUnmarkedTailFunctions(MarkerSymbols);
 
-  // This is deliberately RISC-V 64-only. LLD may canonicalize the only IFUNC
+  // LLD may canonicalize the only RISC-V IFUNC
   // symbol to the IPLT entry, leaving the resolver identifiable only by an
   // R_RISCV_IRELATIVE addend. Function sizes are not final when dynamic
   // relocations are first read, so record exact secondary entries after
   // boundary adjustment and only then process .iplt. x86 and AArch64 .iplt
   // sections were already processed by disassemblePLT() above and retain their
   // original ordering.
-  if (BC->TheTriple->isRISCV64()) {
+  if (BC->isRISCV()) {
     for (const uint64_t Address : RISCVIFUNCResolvers) {
       BinaryFunction *BF = BC->getBinaryFunctionContainingAddress(Address);
       if (!BF || BF->getAddress() == Address)
@@ -1980,7 +1980,7 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
     BF = BC->createBinaryFunction(Symbol->getName().str() + "@PLT", *Section,
                                   EntryAddress, 0, EntrySize,
                                   Section->getAlignment());
-    if (BC->TheTriple->isRISCV64() && Section->getName() == ".iplt")
+    if (BC->isRISCV() && Section->getName() == ".iplt")
       // A deferred .iplt entry is created after adjustFunctionBoundaries(), so
       // give getData() a valid range directly.
       BF->setMaxSize(EntrySize);
@@ -2906,7 +2906,7 @@ bool RewriteInstance::analyzeRelocation(
     // R_RISCV_CALL_PLT must still resolve it through the registered @PLT
     // BinaryData instead of treating that symbol value as a normal function.
     const bool IsRISCVIFuncPLT =
-        BC->TheTriple->isRISCV64() && RType == ELF::R_RISCV_CALL_PLT &&
+        IsRISCV && RType == ELF::R_RISCV_CALL_PLT &&
         ELFSymbolRef(Symbol).getELFType() == ELF::STT_GNU_IFUNC;
     if ((!SymbolAddress || IsRISCVIFuncPLT) && !IsWeakReference(Symbol) &&
         (IsAArch64 || IsRISCV)) {

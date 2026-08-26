@@ -602,6 +602,7 @@ private:
     case Triple::aarch64:
       PLTSI = AArch64_PLTSections;
       break;
+    case Triple::riscv32:
     case Triple::riscv64:
       PLTSI = RISCV_PLTSections;
       break;

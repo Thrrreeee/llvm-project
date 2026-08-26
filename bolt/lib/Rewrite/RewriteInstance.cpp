@@ -1353,7 +1353,18 @@ void RewriteInstance::discoverFileObjects() {
   // that is a subject to dynamic relocation processing.
   processDynamicRelocations();
 
-  // Process PLT section.
+  SmallVector<uint64_t, 1> RISCVIFUNCResolvers;
+  if (BC->TheTriple->isRISCV64()) {
+    for (const BinarySection &Section : BC->allocatableSections())
+      for (const Relocation &Rel : Section.dynamicRelocations())
+        if (Rel.isIRelative() && Rel.Addend)
+          RISCVIFUNCResolvers.push_back(Rel.Addend);
+  }
+
+  // PLT BinaryFunctions are created with size zero and finalized by
+  // adjustFunctionBoundaries() below. In particular, AArch64 BTI later
+  // disassembles PLT functions and requires their finalized sizes. Defer only
+  // RISC-V .iplt until resolver functions and secondary entries are known.
   disassemblePLT();
 
   // See if we missed any functions marked by FDE.
@@ -1385,11 +1396,63 @@ void RewriteInstance::discoverFileObjects() {
                              FDE->getAddressRange());
   }
 
+  // A stripped resolver with an explicit size on the preceding function is
+  // not covered by any BinaryFunction. Register it before boundary adjustment
+  // so its size can be inferred in the usual way. If the preceding function
+  // has no size, defer to boundary adjustment and keep the resolver as its
+  // secondary entry point.
+  for (const uint64_t Address : RISCVIFUNCResolvers) {
+    if (BC->getBinaryFunctionAtAddress(Address) ||
+        BC->getBinaryFunctionContainingAddress(Address))
+      continue;
+
+    ErrorOr<BinarySection &> Section = BC->getSectionForAddress(Address);
+    if (!Section || !Section->isText() || Section->isVirtual())
+      continue;
+
+    auto BFI = BC->getBinaryFunctions().upper_bound(Address);
+    if (BFI != BC->getBinaryFunctions().begin()) {
+      const BinaryFunction &PreviousBF = std::prev(BFI)->second;
+      if (!PreviousBF.getSize() && PreviousBF.getOriginSection() == &*Section)
+        continue;
+    }
+
+    const std::string FunctionName =
+        "__BOLT_IFUNC_RESOLVERat" + Twine::utohexstr(Address).str();
+    BC->createBinaryFunction(FunctionName, *Section, Address, 0);
+  }
+
   BC->setHasSymbolsWithFileName(FileSymbols.size());
 
   // Now that all the functions were created - adjust their boundaries.
   adjustFunctionBoundaries(MarkerSymbols);
   splitUnmarkedTailFunctions(MarkerSymbols);
+
+  // This is deliberately RISC-V 64-only. LLD may canonicalize the only IFUNC
+  // symbol to the IPLT entry, leaving the resolver identifiable only by an
+  // R_RISCV_IRELATIVE addend. Function sizes are not final when dynamic
+  // relocations are first read, so record exact secondary entries after
+  // boundary adjustment and only then process .iplt. x86 and AArch64 .iplt
+  // sections were already processed by disassemblePLT() above and retain their
+  // original ordering.
+  if (BC->TheTriple->isRISCV64()) {
+    for (const uint64_t Address : RISCVIFUNCResolvers) {
+      BinaryFunction *BF = BC->getBinaryFunctionContainingAddress(Address);
+      if (!BF || BF->getAddress() == Address)
+        continue;
+      if (BF->isInConstantIsland(Address)) {
+        BC->errs() << "BOLT-ERROR: IFUNC resolver at 0x"
+                   << Twine::utohexstr(Address)
+                   << " is in constant island of function " << *BF << '\n';
+        exit(1);
+      }
+      BF->addEntryPointAtOffset(Address - BF->getAddress());
+    }
+
+    // Reuse the normal PLT path now that every resolver has an exact function
+    // or secondary-entry symbol.
+    disassemblePLT(/*OnlyRISCVIPLT=*/true);
+  }
 
   // Annotate functions with code/data markers in AArch64
   for (auto &[Address, Type] : MarkerSymbols) {
@@ -1886,11 +1949,16 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
 
   MCSymbol *Symbol = Rel->Symbol;
   if (!Symbol) {
-    if (BC->isRISCV() || !Rel->Addend || !Rel->isIRelative())
+    if (!Rel->Addend || !Rel->isIRelative())
       return;
 
-    // IFUNC trampoline without symbol
+    // IFUNC trampoline without symbol. The existing x86 and AArch64 paths
+    // require the resolver to start a BinaryFunction. For RISC-V, deferred
+    // .iplt processing also permits the exact secondary entry registered
+    // above, which getBinaryFunctionAtAddress() does not return.
     BinaryFunction *TargetBF = BC->getBinaryFunctionAtAddress(Rel->Addend);
+    if (!TargetBF && BC->isRISCV())
+      TargetBF = BC->getBinaryFunctionContainingAddress(Rel->Addend);
     if (!TargetBF) {
       BC->errs()
           << "BOLT-WARNING: Expected BF to be presented as IFUNC resolver at "
@@ -1899,17 +1967,46 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
     }
 
     Symbol = TargetBF->getSymbol();
+    if (BC->isRISCV()) {
+      const uint64_t ResolverOffset = Rel->Addend - TargetBF->getAddress();
+      if (ResolverOffset)
+        Symbol = TargetBF->addEntryPointAtOffset(ResolverOffset);
+    }
   }
 
   ErrorOr<BinarySection &> Section = BC->getSectionForAddress(EntryAddress);
   assert(Section && "cannot get section for address");
-  if (!BF)
+  if (!BF) {
     BF = BC->createBinaryFunction(Symbol->getName().str() + "@PLT", *Section,
                                   EntryAddress, 0, EntrySize,
                                   Section->getAlignment());
-  else
+    if (BC->TheTriple->isRISCV64() && Section->getName() == ".iplt")
+      // A deferred .iplt entry is created after adjustFunctionBoundaries(), so
+      // give getData() a valid range directly.
+      BF->setMaxSize(EntrySize);
+  } else {
     BF->addAlternativeName(Symbol->getName().str() + "@PLT");
+  }
   setPLTSymbol(BF, Symbol->getName());
+
+  // Keep RISC-V alias recovery local to the new path so the established x86
+  // and AArch64 PLT naming behavior remains unchanged.
+  if (BC->isRISCV() && Rel->isIRelative()) {
+    auto ResolverSyms = FileSymRefs.equal_range(Rel->Addend);
+    for (const SymbolRef &AliasSymbol : llvm::make_second_range(
+             llvm::make_range(ResolverSyms.first, ResolverSyms.second))) {
+      if (ELFSymbolRef(AliasSymbol).getELFType() != ELF::STT_GNU_IFUNC)
+        continue;
+      StringRef AliasName = cantFail(AliasSymbol.getName());
+      const std::string PLTName = AliasName.str() + "@PLT";
+      if (!BC->getBinaryDataByName(PLTName)) {
+        BF->addAlternativeName(PLTName);
+        BC->registerNameAtAddress(PLTName, EntryAddress, EntrySize,
+                                  Section->getAlignment());
+      }
+      setPLTSymbol(BF, AliasName);
+    }
+  }
 }
 
 void RewriteInstance::disassemblePLTInstruction(const BinarySection &Section,
@@ -1998,8 +2095,9 @@ void RewriteInstance::disassemblePLTSectionRISCV(BinarySection &Section) {
     }
   };
 
-  // Skip the first special entry since no relocation points to it.
-  uint64_t InstrOffset = 32;
+  // A regular .plt has a first special entry with no relocations pointing to
+  // it, while all .iplt sections are headerless.
+  uint64_t InstrOffset = Section.getName() == ".iplt" ? 0 : 32;
 
   while (InstrOffset < SectionSize) {
     InstructionListType Instructions;
@@ -2061,7 +2159,7 @@ void RewriteInstance::disassemblePLTSectionX86(BinarySection &Section,
   }
 }
 
-void RewriteInstance::disassemblePLT() {
+void RewriteInstance::disassemblePLT(bool OnlyRISCVIPLT) {
   auto analyzeOnePLTSection = [&](BinarySection &Section, uint64_t EntrySize) {
     if (BC->isAArch64())
       return disassemblePLTSectionAArch64(Section);
@@ -2077,6 +2175,10 @@ void RewriteInstance::disassemblePLT() {
     if (!PLTSI)
       continue;
 
+    const bool IsRISCVIPLT = BC->isRISCV() && Section.getName() == ".iplt";
+    if (OnlyRISCVIPLT != IsRISCVIPLT)
+      continue;
+
     analyzeOnePLTSection(Section, PLTSI->EntrySize);
 
     BinaryFunction *PltBF;
@@ -2089,6 +2191,8 @@ void RewriteInstance::disassemblePLT() {
       PltBF = BC->createBinaryFunction(
           "__BOLT_PSEUDO_" + Section.getName().str(), Section,
           Section.getAddress(), 0, PLTSI->EntrySize, Section.getAlignment());
+      if (OnlyRISCVIPLT)
+        PltBF->setMaxSize(PLTSI->EntrySize);
     }
     PltBF->setPseudo(true);
   }
@@ -2769,6 +2873,7 @@ bool RewriteInstance::analyzeRelocation(
   };
 
   const bool IsAArch64 = BC->isAArch64();
+  const bool IsRISCV = BC->isRISCV();
 
   const size_t RelSize = Relocation::getSizeForType(RType);
 
@@ -2797,8 +2902,14 @@ bool RewriteInstance::analyzeRelocation(
     // Section symbols are marked as ST_Debug.
     IsSectionRelocation = (cantFail(Symbol.getType()) == SymbolRef::ST_Debug);
     // Check for PLT entry registered with symbol name
-    if (!SymbolAddress && !IsWeakReference(Symbol) &&
-        (IsAArch64 || BC->isRISCV())) {
+    // LLD may give a defined RISC-V IFUNC symbol the .iplt entry address.
+    // R_RISCV_CALL_PLT must still resolve it through the registered @PLT
+    // BinaryData instead of treating that symbol value as a normal function.
+    const bool IsRISCVIFuncPLT =
+        BC->TheTriple->isRISCV64() && RType == ELF::R_RISCV_CALL_PLT &&
+        ELFSymbolRef(Symbol).getELFType() == ELF::STT_GNU_IFUNC;
+    if ((!SymbolAddress || IsRISCVIFuncPLT) && !IsWeakReference(Symbol) &&
+        (IsAArch64 || IsRISCV)) {
       const BinaryData *BD = BC->getPLTBinaryDataByName(SymbolName);
       SymbolAddress = BD ? BD->getAddress() : 0;
     }
@@ -2858,7 +2969,7 @@ bool RewriteInstance::analyzeRelocation(
     if (SkipVerification)
       return true;
 
-    if (IsAArch64 || BC->isRISCV())
+    if (IsAArch64 || IsRISCV)
       return true;
 
     if (SymbolName == "__hot_start" || SymbolName == "__hot_end")

@@ -309,8 +309,9 @@ private:
   /// Write .eh_frame_hdr.
   void writeEHFrameHeader();
 
-  /// Disassemble and create function entries for PLT.
-  void disassemblePLT();
+  /// Disassemble and create function entries for PLT. Process only the deferred
+  /// RISC-V .iplt section when \p OnlyRISCVIPLT is true; otherwise skip it.
+  void disassemblePLT(bool OnlyRISCVIPLT = false);
 
   /// Auxiliary function to create .plt BinaryFunction on \p EntryAddres
   /// with the \p EntrySize size. \p TargetAddress is the .got entry
@@ -585,7 +586,8 @@ private:
       {".plt"}, {".plt.got"}, {".iplt"}, {nullptr}};
 
   /// RISCV PLT sections.
-  const PLTSectionInfo RISCV_PLTSections[2] = {{".plt"}, {nullptr}};
+  const PLTSectionInfo RISCV_PLTSections[3] = {
+      {".plt", 16}, {".iplt", 16}, {nullptr}};
 
   /// Return PLT information for a section with \p SectionName or nullptr
   /// if the section is not PLT.

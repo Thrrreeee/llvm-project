@@ -1091,6 +1091,12 @@ bool LongJmpPass::relaxLocalBranches(BinaryFunction &BF,
           if (!mayNeedStub(BF.getBinaryContext(), Inst))
             continue;
 
+          // RISC-V direct calls use PseudoCALL/PseudoTAIL, which are emitted as
+          // AUIPC/JALR pairs and are not limited by a short branch encoding.
+          // They also cannot represent intra-function cross-fragment edges.
+          if (BC.isRISCV() && MIB->isCall(Inst))
+            continue;
+
           const MCSymbol *TargetSymbol = MIB->getTargetSymbol(Inst);
           const size_t BitsAvailable = MIB->getPCRelEncodingSize(Inst);
 

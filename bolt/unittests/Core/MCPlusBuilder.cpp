@@ -16,13 +16,19 @@
 #include "X86Subtarget.h"
 #endif // X86_AVAILABLE
 
+#ifdef RISCV_AVAILABLE
+#include "MCTargetDesc/RISCVMCTargetDesc.h"
+#endif // RISCV_AVAILABLE
+
 #include "bolt/Core/BinaryBasicBlock.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/TargetParser/SubtargetFeature.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
@@ -56,17 +62,34 @@ protected:
     ELF64LE::Ehdr *EHdr = reinterpret_cast<typename ELF64LE::Ehdr *>(ElfBuf);
     EHdr->e_ident[llvm::ELF::EI_CLASS] = llvm::ELF::ELFCLASS64;
     EHdr->e_ident[llvm::ELF::EI_DATA] = llvm::ELF::ELFDATA2LSB;
-    EHdr->e_machine = GetParam() == Triple::aarch64 ? EM_AARCH64 : EM_X86_64;
+    switch (GetParam()) {
+    case Triple::aarch64:
+      EHdr->e_machine = EM_AARCH64;
+      break;
+    case Triple::riscv64:
+      EHdr->e_machine = EM_RISCV;
+      break;
+    case Triple::x86_64:
+      EHdr->e_machine = EM_X86_64;
+      break;
+    default:
+      llvm_unreachable("Unsupported architecture");
+      break;
+    }
     MemoryBufferRef Source(StringRef(ElfBuf, sizeof(ElfBuf)), "ELF");
     ObjFile = cantFail(ObjectFile::createObjectFile(Source));
   }
 
   void initializeBolt() {
-    Relocation::Arch = ObjFile->makeTriple().getArch();
+    const Triple TheTriple = GetParam();
+    Relocation::Arch = TheTriple.getArch();
+    // Minimal test ELFs have no RISC-V attributes. Pass an empty feature set so
+    // createBinaryContext() can add the +relax feature required by BOLT.
+    SubtargetFeatures Features;
     BC = cantFail(BinaryContext::createBinaryContext(
-        ObjFile->makeTriple(), std::make_shared<orc::SymbolStringPool>(),
-        ObjFile->getFileName(), nullptr, true, DWARFContext::create(*ObjFile),
-        {llvm::outs(), llvm::errs()}));
+        TheTriple, std::make_shared<orc::SymbolStringPool>(),
+        ObjFile->getFileName(), TheTriple.isRISCV() ? &Features : nullptr, true,
+        DWARFContext::create(*ObjFile), {llvm::outs(), llvm::errs()}));
     ASSERT_FALSE(!BC);
     BC->initializeTarget(std::unique_ptr<MCPlusBuilder>(
         createMCPlusBuilder(GetParam(), BC->MIA.get(), BC->MII.get(),
@@ -891,6 +914,26 @@ TEST_P(MCPlusBuilderTester, AArch64_isCleanRegXOR) {
 }
 
 #endif // AARCH64_AVAILABLE
+
+#ifdef RISCV_AVAILABLE
+
+INSTANTIATE_TEST_SUITE_P(RISCV, MCPlusBuilderTester,
+                         ::testing::Values(Triple::riscv64));
+
+TEST_P(MCPlusBuilderTester, RISCV_isNoop) {
+  if (GetParam() != Triple::riscv64)
+    GTEST_SKIP();
+
+  MCInst Nop =
+      MCInstBuilder(RISCV::ADDI).addReg(RISCV::X0).addReg(RISCV::X0).addImm(0);
+  EXPECT_TRUE(BC->MIB->isNoop(Nop));
+
+  MCInst NonNop =
+      MCInstBuilder(RISCV::ADDI).addReg(RISCV::X1).addReg(RISCV::X1).addImm(0);
+  EXPECT_FALSE(BC->MIB->isNoop(NonNop));
+}
+
+#endif // RISCV_AVAILABLE
 
 #ifdef X86_AVAILABLE
 

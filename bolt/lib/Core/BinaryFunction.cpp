@@ -1712,6 +1712,17 @@ bool BinaryFunction::scanExternalRefs() {
           });
       if (!NeedsPatch)
         continue;
+
+      // An unrelaxed RISC-V call is symbolized at its AUIPC, not its JALR.
+      // Keep the referenced function in place just as for fixed direct calls.
+      if (BC.isRISCV()) {
+        if (const MCSymbol *Target = BC.MIB->getTargetSymbol(Instruction)) {
+          if (BinaryFunction *TargetBF = BC.getFunctionForSymbol(Target)) {
+            TargetBF->setIgnored();
+            continue;
+          }
+        }
+      }
     }
 
     // For AArch64, we need to undo relaxation done by the linker if the target

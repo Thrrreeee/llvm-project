@@ -9,6 +9,13 @@
 # RUN: llvm-nm -n %t.exe > %t.syms
 # RUN: llvm-nm -n %t.bolt >> %t.syms
 # RUN: FileCheck %s --check-prefix=SYMS < %t.syms
+# RUN: llvm-mc -triple=riscv64 -filetype=obj --defsym LONG_CALL=1 %s -o %t.long.o
+# RUN: ld.lld --no-relax --emit-relocs %t.long.o -o %t.long.exe
+# RUN: llvm-bolt %t.long.exe --skip-funcs=fixed --reorder-functions=cdsort -o %t.long.bolt
+# RUN: %t.long.bolt
+# RUN: llvm-nm -n %t.long.exe > %t.long.syms
+# RUN: llvm-nm -n %t.long.bolt >> %t.long.syms
+# RUN: FileCheck %s --check-prefix=SYMS < %t.long.syms
 
 # SYMS: [[FIXED:[0-9a-f]+]] T fixed
 # SYMS: [[TARGET:[0-9a-f]+]] T target
@@ -31,7 +38,11 @@ _start:
 fixed:
   addi sp, sp, -16
   sd ra, 0(sp)
+  .ifdef LONG_CALL
+  call target
+  .else
   jal target
+  .endif
   ld ra, 0(sp)
   addi sp, sp, 16
   ret

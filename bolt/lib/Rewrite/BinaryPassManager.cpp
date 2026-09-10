@@ -30,6 +30,7 @@
 #include "bolt/Passes/PointerAuthCFIFixup.h"
 #include "bolt/Passes/ProfileQualityStats.h"
 #include "bolt/Passes/RegReAssign.h"
+#include "bolt/Passes/RISCVRelaxationPass.h"
 #include "bolt/Passes/ReorderData.h"
 #include "bolt/Passes/ReorderFunctions.h"
 #include "bolt/Passes/RetpolineInsertion.h"
@@ -548,6 +549,9 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
     Manager.registerPass(
         std::make_unique<PointerAuthCFIFixup>(PrintPAuthCFIFixup));
   }
+
+  if (BC.isRISCV())
+    Manager.registerPass(std::make_unique<RISCVRelaxationPass>());
 
   // This pass should always run last.*
   Manager.registerPass(std::make_unique<FinalizeFunctions>(PrintFinalized));

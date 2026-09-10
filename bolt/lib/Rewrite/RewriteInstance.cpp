@@ -5684,7 +5684,11 @@ void RewriteInstance::updateELFSymbolTable(
   // point.
   auto addExtraSymbols = [&](const BinaryFunction &Function,
                              const ELFSymTy &FunctionSymbol) {
-    if (Function.isFolded()) {
+    const StringRef Name = cantFail(FunctionSymbol.getName(StringSection));
+    const bool IsMarker =
+        BC->getMarkerType(FunctionSymbol.getType(), FunctionSymbol.st_size,
+                          Name) != MarkerSymType::NONE;
+    if (Function.isFolded() && !IsMarker) {
       const BinaryFunction *ICFParent = Function.getFoldedIntoFunction();
       ELFSymTy ICFSymbol = FunctionSymbol;
       SmallVector<char, 256> Buf;
@@ -5716,14 +5720,19 @@ void RewriteInstance::updateELFSymbolTable(
            Function.getLayout().getSplitFragments()) {
         if (FF.getAddress()) {
           ELFSymTy NewColdSym = FunctionSymbol;
+          // Mapping symbols describe the ISA at this address. Preserve their
+          // names: appending a fragment suffix would corrupt RISC-V ISA
+          // strings.
           const SmallString<256> SymbolName =
-              getSplitSymbolName(FF, FunctionSymbol);
+              IsMarker ? SmallString<256>(Name)
+                       : getSplitSymbolName(FF, FunctionSymbol);
           NewColdSym.st_name = AddToStrTab(SymbolName);
           NewColdSym.st_shndx =
               Function.getCodeSection(FF.getFragmentNum())->getIndex();
           NewColdSym.st_value = FF.getAddress();
-          NewColdSym.st_size = FF.getImageSize();
-          NewColdSym.setBindingAndType(ELF::STB_LOCAL, ELF::STT_FUNC);
+          NewColdSym.st_size = IsMarker ? 0 : FF.getImageSize();
+          NewColdSym.setBindingAndType(
+              ELF::STB_LOCAL, IsMarker ? ELF::STT_NOTYPE : ELF::STT_FUNC);
           Symbols.emplace_back(NewColdSym);
         }
       }
@@ -5825,6 +5834,8 @@ void RewriteInstance::updateELFSymbolTable(
     // Handle special symbols based on their name.
     Expected<StringRef> SymbolName = Symbol.getName(StringSection);
     assert(SymbolName && "cannot get symbol name");
+    const bool IsMarker = BC->getMarkerType(Symbol.getType(), Symbol.st_size,
+                                            *SymbolName) != MarkerSymType::NONE;
 
     auto updateSymbolValue = [&](const StringRef Name,
                                  std::optional<uint64_t> Value = std::nullopt) {
@@ -5861,7 +5872,7 @@ void RewriteInstance::updateELFSymbolTable(
       // corresponding section index but otherwise leave it unchanged.
       if (Function->isEmitted()) {
         NewSymbol.st_value = Function->getOutputAddress();
-        NewSymbol.st_size = Function->getOutputSize();
+        NewSymbol.st_size = IsMarker ? 0 : Function->getOutputSize();
         NewSymbol.st_shndx = Function->getCodeSection()->getIndex();
       } else if (Symbol.st_shndx < ELF::SHN_LORESERVE) {
         NewSymbol.st_shndx = getNewSectionIndex(Symbol.st_shndx);
@@ -5877,13 +5888,9 @@ void RewriteInstance::updateELFSymbolTable(
       // update their addresses to reflect the output layout.
       // Skip AArch64/RISC-V marker symbols ($d, $x) inside functions —
       // BOLT generates its own via addExtraSymbols.
-      auto IsMarkerSymbol = [&]() {
-        return BC->getMarkerType(Symbol.getType(), Symbol.st_size,
-                                 *SymbolName) != MarkerSymType::NONE;
-      };
       const bool IsLocalLabel = Symbol.getType() == ELF::STT_NOTYPE &&
                                 Symbol.getBinding() == ELF::STB_LOCAL &&
-                                Symbol.st_size == 0 && !IsMarkerSymbol();
+                                Symbol.st_size == 0 && !IsMarker;
       Function =
           (Symbol.getType() == ELF::STT_FUNC || IsLocalLabel)
               ? BC->getBinaryFunctionContainingAddress(Symbol.st_value,
@@ -5954,7 +5961,7 @@ void RewriteInstance::updateELFSymbolTable(
 
         // Drop AArch64/RISC-V marker symbols ($d, $x) inside functions —
         // BOLT generates its own via addExtraSymbols.
-        if (IsMarkerSymbol() &&
+        if (IsMarker &&
             BC->getBinaryFunctionContainingAddress(Symbol.st_value,
                                                    /*CheckPastEnd=*/false,
                                                    /*UseMaxSize=*/true)) {

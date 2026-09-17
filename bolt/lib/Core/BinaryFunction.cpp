@@ -1692,6 +1692,15 @@ bool BinaryFunction::scanExternalRefs() {
     if (!BC.HasRelocations)
       continue;
 
+    // A fixed RISC-V conditional branch may not reach a relocated function.
+    // Extending it or patching the target entry would require a scratch
+    // register, which can be live across branches in hand-written assembly.
+    if (BC.isRISCV() && BranchTargetSymbol &&
+        BC.MIB->isConditionalBranch(Instruction)) {
+      BC.getFunctionForSymbol(BranchTargetSymbol)->setIgnored();
+      continue;
+    }
+
     if (BranchTargetSymbol) {
       BC.MIB->replaceBranchTarget(Instruction, BranchTargetSymbol,
                                   Emitter.LocalCtx.get());

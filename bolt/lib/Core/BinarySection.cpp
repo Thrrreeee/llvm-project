@@ -16,6 +16,7 @@
 #include "bolt/Utils/Utils.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Endian.h"
 
 #define DEBUG_TYPE "bolt"
 
@@ -191,8 +192,22 @@ void BinarySection::flushPendingRelocations(raw_fd_ostream &OS,
       ++SkippedPendingRelocations;
       continue;
     }
+    uint64_t Contents = 0;
+    if (Relocation::isRISCVControlFlowRelocation(Reloc.Type)) {
+      const size_t Size = Reloc.getSize();
+      StringRef Input = getContents();
+      if (Reloc.Offset > Input.size() || Size > Input.size() - Reloc.Offset)
+        report_fatal_error("RISC-V relocation outside original section");
+      if (!Relocation::canEncodeValue(Reloc.Type, Value,
+                                      SectionAddress + Reloc.Offset))
+        report_fatal_error("fixed RISC-V reference exceeds its encoding range");
+      const char *Data = Input.data() + Reloc.Offset;
+      Contents = Size == 2   ? support::endian::read16le(Data)
+                 : Size == 4 ? support::endian::read32le(Data)
+                             : support::endian::read64le(Data);
+    }
     Value = Relocation::encodeValue(Reloc.Type, Value,
-                                    SectionAddress + Reloc.Offset);
+                                    SectionAddress + Reloc.Offset, Contents);
 
     safePWrite(OS, reinterpret_cast<const char *>(&Value),
                Relocation::getSizeForType(Reloc.Type),

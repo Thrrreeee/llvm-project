@@ -10,6 +10,7 @@
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
@@ -81,6 +82,89 @@ INSTANTIATE_TEST_SUITE_P(X86, BinaryContextTester,
 
 INSTANTIATE_TEST_SUITE_P(RISCV, BinaryContextTester,
                          ::testing::Values(Triple::riscv64));
+
+TEST_P(BinaryContextTester, RISCVFixedReferenceRanges) {
+  if (GetParam() != Triple::riscv64)
+    GTEST_SKIP();
+  struct Range {
+    uint32_t Type;
+    int64_t Min;
+    int64_t Max;
+  };
+  const Range Ranges[] = {
+      {R_RISCV_BRANCH, -4096, 4094},
+      {R_RISCV_JAL, -1048576, 1048574},
+      {R_RISCV_RVC_BRANCH, -256, 254},
+      {R_RISCV_RVC_JUMP, -2048, 2046},
+      {R_RISCV_CALL, -2147485696LL, 2147481598LL},
+      {R_RISCV_CALL_PLT, -2147485696LL, 2147481598LL},
+  };
+  const uint64_t PC = 0x100000000;
+  for (const Range &R : Ranges) {
+    SCOPED_TRACE(R.Type);
+    EXPECT_TRUE(Relocation::canEncodeValue(R.Type, PC + R.Min, PC));
+    EXPECT_TRUE(Relocation::canEncodeValue(R.Type, PC + R.Max, PC));
+    EXPECT_FALSE(Relocation::canEncodeValue(R.Type, PC + R.Min - 2, PC));
+    EXPECT_FALSE(Relocation::canEncodeValue(R.Type, PC + R.Max + 2, PC));
+    EXPECT_FALSE(Relocation::canEncodeValue(R.Type, PC + 1, PC));
+  }
+}
+
+TEST_P(BinaryContextTester, FlushRISCVInstructionRelocations) {
+  if (GetParam() != Triple::riscv64)
+    GTEST_SKIP();
+  // Expected encodings are assembled independently. Include nonzero original
+  // immediates, backward edges, compressed registers, alternate link registers
+  // and a negative low immediate requiring carry into AUIPC's high immediate.
+  struct TestCase {
+    uint32_t Type;
+    uint64_t Original;
+    uint64_t Expected;
+    int64_t Displacement;
+  };
+  const TestCase Cases[] = {
+      {R_RISCV_BRANCH, 0x02664063, 0x7e664fe3, 4094},  // blt a2, t1
+      {R_RISCV_BRANCH, 0x03397063, 0x81397063, -4096}, // bgeu s2, s3
+      {R_RISCV_JAL, 0x008002ef, 0x7ffff2ef, 1048574},  // jal t0
+      {R_RISCV_JAL, 0x008000ef, 0x800000ef, -1048576}, // jal ra
+      {R_RISCV_RVC_BRANCH, 0xc089, 0xccfd, 254},       // c.beqz s1
+      {R_RISCV_RVC_BRANCH, 0xe309, 0xf301, -256},      // c.bnez a4
+      {R_RISCV_RVC_JUMP, 0xa009, 0xaffd, 2046},
+      {R_RISCV_RVC_JUMP, 0xa009, 0xb001, -2048},
+      {R_RISCV_CALL_PLT, 0x010280e700100297, 0x800280e700013297, 75776},
+      {R_RISCV_CALL, 0x010082e700100097, 0x800082e7fffee097, -75776},
+  };
+  constexpr size_t DataSize = sizeof(Cases) / sizeof(Cases[0]) * 8;
+  uint8_t *Data = new uint8_t[DataSize];
+  DenseMap<const MCSymbol *, uint64_t> Targets;
+  for (size_t I = 0; I < std::size(Cases); ++I)
+    support::endian::write64le(Data + I * 8, Cases[I].Original);
+  BinarySection &BS = BC->registerOrUpdateSection(
+      ".text", ELF::SHT_PROGBITS, ELF::SHF_EXECINSTR | ELF::SHF_ALLOC, Data,
+      DataSize, 4);
+  for (size_t I = 0; I < std::size(Cases); ++I) {
+    MCSymbol *Symbol = BC->Ctx->createNamedTempSymbol();
+    Targets[Symbol] = I * 8 + Cases[I].Displacement;
+    BS.addPendingRelocation(Relocation{I * 8, Symbol, Cases[I].Type, 0, 0});
+  }
+  SmallString<64> Path;
+  int FD;
+  ASSERT_FALSE(
+      sys::fs::createTemporaryFile("bolt-riscv-relocations", "bin", FD, Path));
+  raw_fd_ostream OS(FD, true);
+  OS.write(reinterpret_cast<const char *>(Data), DataSize);
+  OS.flush();
+  BS.flushPendingRelocations(
+      OS, [&](const MCSymbol *Symbol) { return Targets.lookup(Symbol); });
+  auto Buffer = MemoryBuffer::getFile(Path);
+  ASSERT_TRUE(Buffer);
+  for (size_t I = 0; I < std::size(Cases); ++I) {
+    SCOPED_TRACE(I);
+    EXPECT_EQ(support::endian::read64le((*Buffer)->getBufferStart() + I * 8),
+              Cases[I].Expected);
+  }
+  sys::fs::remove(Path);
+}
 
 #endif
 

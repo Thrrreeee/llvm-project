@@ -17,6 +17,7 @@
 #endif // X86_AVAILABLE
 
 #ifdef RISCV_AVAILABLE
+#include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "RISCVSubtarget.h"
 #endif // RISCV_AVAILABLE
@@ -919,6 +920,89 @@ TEST_P(MCPlusBuilderTester, AArch64_isCleanReg) {
 
 INSTANTIATE_TEST_SUITE_P(RISCV, MCPlusBuilderTester,
                          ::testing::Values(Triple::riscv64));
+
+TEST_P(MCPlusBuilderTester, RISCV_CreateBranchRelocations) {
+  if (GetParam() != Triple::riscv64)
+    GTEST_SKIP();
+  // Exercise the same encodeInstruction -> createRelocation path used when
+  // scanning a fixed function. The displacement is not known at encoding time.
+  MCSymbol *Symbol = BC->Ctx->createNamedTempSymbol();
+  const MCExpr *Expr =
+      MCBinaryExpr::createAdd(MCSymbolRefExpr::create(Symbol, *BC->Ctx),
+                              MCConstantExpr::create(-8, *BC->Ctx), *BC->Ctx);
+  const std::pair<MCInst, uint32_t> Cases[] = {
+      {MCInstBuilder(RISCV::BLT)
+           .addReg(RISCV::X11)
+           .addReg(RISCV::X12)
+           .addExpr(Expr),
+       R_RISCV_BRANCH},
+      {MCInstBuilder(RISCV::JAL).addReg(RISCV::X5).addExpr(Expr), R_RISCV_JAL},
+      {MCInstBuilder(RISCV::C_BEQZ).addReg(RISCV::X11).addExpr(Expr),
+       R_RISCV_RVC_BRANCH},
+      {MCInstBuilder(RISCV::C_J).addExpr(Expr), R_RISCV_RVC_JUMP},
+  };
+  auto Emitter = BC->createIndependentMCCodeEmitter();
+  for (const auto &[Inst, Type] : Cases) {
+    SCOPED_TRACE(Type);
+    SmallString<8> Code;
+    SmallVector<MCFixup, 2> Fixups;
+    Emitter.MCE->encodeInstruction(Inst, Code, Fixups, *BC->STI);
+    ASSERT_EQ(Fixups.size(), 1u);
+    auto Rel = BC->MIB->createRelocation(Fixups.front(), *BC->MAB);
+    ASSERT_TRUE(Rel);
+    EXPECT_EQ(Rel->Offset, 0u);
+    EXPECT_EQ(Rel->Symbol, Symbol);
+    EXPECT_EQ(Rel->Type, Type);
+    EXPECT_EQ(Rel->Addend, uint64_t(-8));
+  }
+}
+
+TEST_P(MCPlusBuilderTester, RISCV_CreateCallRelocations) {
+  if (GetParam() != Triple::riscv64)
+    GTEST_SKIP();
+  MCSymbol *Symbol = BC->Ctx->createNamedTempSymbol();
+  const MCExpr *Expr =
+      MCBinaryExpr::createAdd(MCSymbolRefExpr::create(Symbol, *BC->Ctx),
+                              MCConstantExpr::create(8, *BC->Ctx), *BC->Ctx);
+  MCInst Inst;
+  Expr = BC->MIB->getTargetExprFor(Inst, Expr, *BC->Ctx, R_RISCV_CALL_PLT);
+  const std::pair<unsigned, uint32_t> Cases[] = {
+      {RISCV::fixup_riscv_call, R_RISCV_CALL_PLT},
+      {RISCV::fixup_riscv_call_plt, R_RISCV_CALL_PLT},
+      {R_RISCV_CALL, R_RISCV_CALL},
+      {R_RISCV_CALL_PLT, R_RISCV_CALL_PLT},
+  };
+  for (const auto &[Kind, Type] : Cases) {
+    SCOPED_TRACE(Kind);
+    auto Rel = BC->MIB->createRelocation(
+        MCFixup::create(4, Expr, MCFixupKind(Kind), true), *BC->MAB);
+    ASSERT_TRUE(Rel);
+    EXPECT_EQ(Rel->Offset, 4u);
+    EXPECT_EQ(Rel->Symbol, Symbol);
+    EXPECT_EQ(Rel->Type, Type);
+    EXPECT_EQ(Rel->Addend, 8u);
+  }
+}
+
+TEST_P(MCPlusBuilderTester, RISCV_UnsupportedRelocations) {
+  if (GetParam() != Triple::riscv64)
+    GTEST_SKIP();
+  const MCExpr *Expr =
+      MCSymbolRefExpr::create(BC->Ctx->createNamedTempSymbol(), *BC->Ctx);
+  for (MCFixupKind Kind :
+       {MCFixupKind(FK_Data_1), MCFixupKind(RISCV::fixup_riscv_pcrel_hi20)})
+    EXPECT_FALSE(
+        BC->MIB->createRelocation(MCFixup::create(0, Expr, Kind), *BC->MAB));
+
+  // A relocation with one symbol and addend cannot represent a difference of
+  // two independently placed symbols.
+  Expr = MCBinaryExpr::createSub(
+      Expr, MCSymbolRefExpr::create(BC->Ctx->createNamedTempSymbol(), *BC->Ctx),
+      *BC->Ctx);
+  EXPECT_FALSE(BC->MIB->createRelocation(
+      MCFixup::create(0, Expr, MCFixupKind(RISCV::fixup_riscv_branch), true),
+      *BC->MAB));
+}
 
 TEST_P(MCPlusBuilderTester, RISCV_NoFlagsRegister) {
   if (GetParam() != Triple::riscv64)

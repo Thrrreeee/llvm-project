@@ -328,24 +328,78 @@ static uint64_t encodeValueAArch64(uint32_t Type, uint64_t Value, uint64_t PC) {
   return Value;
 }
 
-static uint64_t canEncodeValueRISCV(uint32_t Type, uint64_t Value,
-                                    uint64_t PC) {
+bool Relocation::isRISCVControlFlowRelocation(uint32_t Type) {
+  if (Arch != Triple::riscv32 && Arch != Triple::riscv64)
+    return false;
+  switch (Type) {
+  default:
+    return false;
+  case ELF::R_RISCV_BRANCH:
+  case ELF::R_RISCV_JAL:
+  case ELF::R_RISCV_RVC_BRANCH:
+  case ELF::R_RISCV_RVC_JUMP:
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    return true;
+  }
+}
+
+static bool canEncodeValueRISCV(uint32_t Type, uint64_t Value, uint64_t PC) {
+  const int64_t Offset = Value - PC;
   switch (Type) {
   default:
     llvm_unreachable("unsupported relocation");
   case ELF::R_RISCV_32:
   case ELF::R_RISCV_64:
     return true;
+  case ELF::R_RISCV_BRANCH:
+    return !(Offset & 1) && isInt<13>(Offset);
+  case ELF::R_RISCV_JAL:
+    return !(Offset & 1) && isInt<21>(Offset);
+  case ELF::R_RISCV_RVC_BRANCH:
+    return !(Offset & 1) && isInt<9>(Offset);
+  case ELF::R_RISCV_RVC_JUMP:
+    return !(Offset & 1) && isInt<12>(Offset);
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    // Account for the carry from the signed low immediate. In RV64 the
+    // rounded high part must still fit the sign-extended AUIPC immediate.
+    return !(Offset & 1) && Offset >= INT64_C(-2147485696) &&
+           Offset <= INT64_C(2147481599);
   }
 }
 
-static uint64_t encodeValueRISCV(uint32_t Type, uint64_t Value, uint64_t PC) {
+static uint64_t encodeValueRISCV(uint32_t Type, uint64_t Value, uint64_t PC,
+                                 uint64_t Contents) {
+  const uint64_t Offset = Value - PC;
   switch (Type) {
   default:
     llvm_unreachable("unsupported relocation");
   case ELF::R_RISCV_32:
   case ELF::R_RISCV_64:
     break;
+  case ELF::R_RISCV_BRANCH:
+    return (Contents & ~UINT64_C(0xfe000f80)) | ((Offset & 0x1000) << 19) |
+           ((Offset & 0x7e0) << 20) | ((Offset & 0x1e) << 7) |
+           ((Offset & 0x800) >> 4);
+  case ELF::R_RISCV_JAL:
+    return (Contents & ~UINT64_C(0xfffff000)) | ((Offset & 0x100000) << 11) |
+           ((Offset & 0x7fe) << 20) | ((Offset & 0x800) << 9) |
+           (Offset & 0xff000);
+  case ELF::R_RISCV_RVC_BRANCH:
+    return (Contents & ~UINT64_C(0x1c7c)) | ((Offset & 0x100) << 4) |
+           ((Offset & 0x18) << 7) | ((Offset & 0xc0) >> 1) |
+           ((Offset & 0x6) << 2) | ((Offset & 0x20) >> 3);
+  case ELF::R_RISCV_RVC_JUMP:
+    return (Contents & ~UINT64_C(0x1ffc)) | ((Offset & 0x800) << 1) |
+           ((Offset & 0x10) << 7) | ((Offset & 0x300) << 1) |
+           ((Offset & 0x400) >> 2) | ((Offset & 0x40) << 1) |
+           ((Offset & 0x80) >> 1) | ((Offset & 0xe) << 2) |
+           ((Offset & 0x20) >> 3);
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    return (Contents & UINT64_C(0x000fffff00000fff)) |
+           ((Offset + 0x800) & UINT64_C(0xfffff000)) | ((Offset & 0xfff) << 52);
   }
   return Value;
 }
@@ -782,7 +836,8 @@ bool Relocation::skipRelocationType(uint32_t Type) {
   }
 }
 
-uint64_t Relocation::encodeValue(uint32_t Type, uint64_t Value, uint64_t PC) {
+uint64_t Relocation::encodeValue(uint32_t Type, uint64_t Value, uint64_t PC,
+                                 uint64_t Contents) {
   switch (Arch) {
   default:
     llvm_unreachable("Unsupported architecture");
@@ -790,7 +845,7 @@ uint64_t Relocation::encodeValue(uint32_t Type, uint64_t Value, uint64_t PC) {
     return encodeValueAArch64(Type, Value, PC);
   case Triple::riscv64:
   case Triple::riscv32:
-    return encodeValueRISCV(Type, Value, PC);
+    return encodeValueRISCV(Type, Value, PC, Contents);
   case Triple::x86_64:
     return encodeValueX86(Type, Value, PC);
   }

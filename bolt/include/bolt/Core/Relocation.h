@@ -95,7 +95,13 @@ public:
   static bool skipRelocationType(uint32_t Type);
 
   /// Adjust value depending on relocation type (make it PC relative or not).
-  static uint64_t encodeValue(uint32_t Type, uint64_t Value, uint64_t PC);
+  /// For RISC-V control transfers, preserve non-immediate bits from Contents.
+  static uint64_t encodeValue(uint32_t Type, uint64_t Value, uint64_t PC,
+                              uint64_t Contents = 0);
+
+  /// Whether this is a RISC-V control-flow relocation whose instruction bits
+  /// must be preserved when updating its displacement in the original code.
+  static bool isRISCVControlFlowRelocation(uint32_t Type);
 
   /// Return true if there are enough bits to encode the relocation value.
   static bool canEncodeValue(uint32_t Type, uint64_t Value, uint64_t PC);

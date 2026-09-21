@@ -17,6 +17,8 @@
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/Endian.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 using namespace bolt;
@@ -328,14 +330,110 @@ static uint64_t encodeValueAArch64(uint32_t Type, uint64_t Value, uint64_t PC) {
   return Value;
 }
 
-static uint64_t canEncodeValueRISCV(uint32_t Type, uint64_t Value,
-                                    uint64_t PC) {
+bool Relocation::isRISCVControlFlowRelocation(uint32_t Type) {
+  if (Arch != Triple::riscv32 && Arch != Triple::riscv64)
+    return false;
+  switch (Type) {
+  default:
+    return false;
+  case ELF::R_RISCV_BRANCH:
+  case ELF::R_RISCV_JAL:
+  case ELF::R_RISCV_RVC_BRANCH:
+  case ELF::R_RISCV_RVC_JUMP:
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    return true;
+  }
+}
+
+static bool canEncodeValueRISCV(uint32_t Type, uint64_t Value, uint64_t PC) {
+  // PC-relative arithmetic wraps at XLEN, including branches across address 0.
+  const int64_t Offset = Relocation::Arch == Triple::riscv32
+                             ? SignExtend64<32>(Value - PC)
+                             : Value - PC;
   switch (Type) {
   default:
     llvm_unreachable("unsupported relocation");
   case ELF::R_RISCV_32:
   case ELF::R_RISCV_64:
     return true;
+  case ELF::R_RISCV_BRANCH:
+    return !(Offset & 1) && isInt<13>(Offset);
+  case ELF::R_RISCV_JAL:
+    return !(Offset & 1) && isInt<21>(Offset);
+  case ELF::R_RISCV_RVC_BRANCH:
+    return !(Offset & 1) && isInt<9>(Offset);
+  case ELF::R_RISCV_RVC_JUMP:
+    return !(Offset & 1) && isInt<12>(Offset);
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    // AUIPC/JALR can reach any aligned address in the RV32 address space.
+    if (Relocation::Arch == Triple::riscv32)
+      return !(Offset & 1);
+    // Account for the carry from the signed low immediate. In RV64 the
+    // rounded high part must still fit the sign-extended AUIPC immediate.
+    return !(Offset & 1) && Offset >= INT64_C(-2147485696) &&
+           Offset <= INT64_C(2147481599);
+  }
+}
+
+void Relocation::applyRISCVControlFlowRelocation(MutableArrayRef<char> Data,
+                                                 uint32_t Type, uint64_t Value,
+                                                 uint64_t PC) {
+  assert(isRISCVControlFlowRelocation(Type) &&
+         "expected a RISC-V control-flow relocation");
+  assert(Data.size() == getSizeForType(Type) &&
+         "unexpected RISC-V instruction buffer size");
+  if (!canEncodeValueRISCV(Type, Value, PC))
+    report_fatal_error("fixed RISC-V reference exceeds its encoding range");
+
+  auto Patch16 = [](char *Location, uint16_t Immediate, uint16_t Mask) {
+    const uint16_t Inst = support::endian::read16le(Location);
+    support::endian::write16le(Location, (Inst & ~Mask) | Immediate);
+  };
+  auto Patch32 = [](char *Location, uint32_t Immediate, uint32_t Mask) {
+    const uint32_t Inst = support::endian::read32le(Location);
+    support::endian::write32le(Location, (Inst & ~Mask) | Immediate);
+  };
+
+  const uint64_t Offset = Value - PC;
+  switch (Type) {
+  default:
+    llvm_unreachable("unsupported RISC-V control-flow relocation");
+  case ELF::R_RISCV_BRANCH:
+    Patch32(Data.data(),
+            ((Offset & 0x1000) << 19) | ((Offset & 0x7e0) << 20) |
+                ((Offset & 0x1e) << 7) | ((Offset & 0x800) >> 4),
+            0xfe000f80);
+    return;
+  case ELF::R_RISCV_JAL:
+    Patch32(Data.data(),
+            ((Offset & 0x100000) << 11) | ((Offset & 0x7fe) << 20) |
+                ((Offset & 0x800) << 9) | (Offset & 0xff000),
+            0xfffff000);
+    return;
+  case ELF::R_RISCV_RVC_BRANCH:
+    Patch16(Data.data(),
+            ((Offset & 0x100) << 4) | ((Offset & 0x18) << 7) |
+                ((Offset & 0xc0) >> 1) | ((Offset & 0x6) << 2) |
+                ((Offset & 0x20) >> 3),
+            0x1c7c);
+    return;
+  case ELF::R_RISCV_RVC_JUMP:
+    Patch16(Data.data(),
+            ((Offset & 0x800) << 1) | ((Offset & 0x10) << 7) |
+                ((Offset & 0x300) << 1) | ((Offset & 0x400) >> 2) |
+                ((Offset & 0x40) << 1) | ((Offset & 0x80) >> 1) |
+                ((Offset & 0xe) << 2) | ((Offset & 0x20) >> 3),
+            0x1ffc);
+    return;
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    // Update AUIPC and JALR separately, preserving both instructions' register
+    // operands. Round the high part to account for the signed low immediate.
+    Patch32(Data.data(), (Offset + 0x800) & 0xfffff000, 0xfffff000);
+    Patch32(Data.data() + 4, (Offset & 0xfff) << 20, 0xfff00000);
+    return;
   }
 }
 

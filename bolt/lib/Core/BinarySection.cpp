@@ -14,6 +14,7 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/CommandLine.h"
 
@@ -189,6 +190,24 @@ void BinarySection::flushPendingRelocations(raw_fd_ostream &OS,
                                     SectionAddress + Reloc.Offset)) {
 
       ++SkippedPendingRelocations;
+      continue;
+    }
+    if (Relocation::isRISCVControlFlowRelocation(Reloc.Type)) {
+      const size_t Size = Reloc.getSize();
+      StringRef Input = getContents();
+      if (Reloc.Offset > Input.size() || Size > Input.size() - Reloc.Offset)
+        report_fatal_error("RISC-V relocation outside original section");
+
+      // Patch a copy: the input section contents must remain unchanged.
+      SmallString<8> Code(Input.substr(Reloc.Offset, Size));
+      Relocation::applyRISCVControlFlowRelocation(
+          Code, Reloc.Type, Value, SectionAddress + Reloc.Offset);
+      safePWrite(OS, Code.data(), Code.size(),
+                 SectionFileOffset + Reloc.Offset);
+      LLVM_DEBUG(dbgs() << "BOLT-DEBUG: applying RISC-V relocation at section "
+                           "offset 0x"
+                        << Twine::utohexstr(Reloc.Offset) << " targeting 0x"
+                        << Twine::utohexstr(Value) << '\n');
       continue;
     }
     Value = Relocation::encodeValue(Reloc.Type, Value,

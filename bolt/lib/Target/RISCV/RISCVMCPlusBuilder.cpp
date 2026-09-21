@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCAsmInfo.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "RISCVMCSymbolizer.h"
@@ -19,6 +20,7 @@
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCValue.h"
 #include "llvm/Support/ErrorHandling.h"
 
 #define DEBUG_TYPE "mcplus"
@@ -47,6 +49,48 @@ class RISCVMCPlusBuilder : public MCPlusBuilder {
 
 public:
   using MCPlusBuilder::MCPlusBuilder;
+
+  std::optional<Relocation>
+  createRelocation(const MCFixup &Fixup,
+                   const MCAsmBackend &MAB) const override {
+    uint32_t Type;
+    switch (Fixup.getKind()) {
+    default:
+      // MC may encode ELF relocation types directly as fixup kinds.
+      if (!Relocation::isRISCVControlFlowRelocation(Fixup.getKind()))
+        return std::nullopt;
+      Type = Fixup.getKind();
+      break;
+    case RISCV::fixup_riscv_branch:
+      Type = ELF::R_RISCV_BRANCH;
+      break;
+    case RISCV::fixup_riscv_jal:
+      Type = ELF::R_RISCV_JAL;
+      break;
+    case RISCV::fixup_riscv_rvc_branch:
+      Type = ELF::R_RISCV_RVC_BRANCH;
+      break;
+    case RISCV::fixup_riscv_rvc_jump:
+      Type = ELF::R_RISCV_RVC_JUMP;
+      break;
+    case RISCV::fixup_riscv_call:
+    case RISCV::fixup_riscv_call_plt:
+      Type = ELF::R_RISCV_CALL_PLT;
+      break;
+    }
+    // The fixup kind already carries the relocation specifier. Evaluating a
+    // target expression without an assembler can fail, so evaluate its symbol
+    // and addend independently of the %call/%pcrel wrapper.
+    const MCExpr *Expr = Fixup.getValue();
+    if (const auto *Specifier = dyn_cast<MCSpecifierExpr>(Expr))
+      Expr = Specifier->getSubExpr();
+    MCValue Value;
+    if (!Expr->evaluateAsRelocatable(Value, nullptr) || Value.getSubSym())
+      return std::nullopt;
+    return Relocation{Fixup.getOffset(),
+                      const_cast<MCSymbol *>(Value.getAddSym()), Type,
+                      static_cast<uint64_t>(Value.getConstant()), 0};
+  }
 
   MCPhysReg getFlagsReg() const override { return RISCV::NoRegister; }
 

@@ -14,6 +14,7 @@
 #ifndef BOLT_CORE_RELOCATION_H
 #define BOLT_CORE_RELOCATION_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/TargetParser/Triple.h"
@@ -96,6 +97,19 @@ public:
 
   /// Adjust value depending on relocation type (make it PC relative or not).
   static uint64_t encodeValue(uint32_t Type, uint64_t Value, uint64_t PC);
+
+  /// Whether this is a RISC-V control-flow relocation whose instruction bits
+  /// must be preserved when updating its displacement in the original code.
+  static bool isRISCVControlFlowRelocation(uint32_t Type);
+
+  /// Apply a RISC-V control-flow relocation to the original instruction bytes
+  /// in Data, preserving all non-immediate fields. Data must contain exactly
+  /// getSizeForType(Type) bytes. Value is the target address and PC is the
+  /// address of the first instruction. Diagnose an unencodable displacement
+  /// before modifying Data.
+  static void applyRISCVControlFlowRelocation(MutableArrayRef<char> Data,
+                                              uint32_t Type, uint64_t Value,
+                                              uint64_t PC);
 
   /// Return true if there are enough bits to encode the relocation value.
   static bool canEncodeValue(uint32_t Type, uint64_t Value, uint64_t PC);

@@ -382,6 +382,11 @@ public:
     PendingRelocations.push_back(Rel);
   }
 
+  /// Return relocations to be applied to the original section contents.
+  ArrayRef<Relocation> getPendingRelocations() const {
+    return PendingRelocations;
+  }
+
   /// Add patch to the input contents of this section.
   void addPatch(uint64_t Offset, const SmallVectorImpl<char> &Bytes) {
     Patches.emplace_back(BinaryPatch(Offset, Bytes));

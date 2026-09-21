@@ -1573,6 +1573,14 @@ bool BinaryFunction::scanExternalRefs() {
   bool Success = true;
   bool DisassemblyFailed = false;
   SmallPtrSet<BinaryFunction *, 4> InvalidTargets;
+  SmallPtrSet<BinaryFunction *, 4> FixedTargets;
+
+  auto hasRISCVCallInteriorEntry = [&](uint64_t Offset) {
+    for (uint64_t Entry = Offset + 2; Entry < Offset + 8; Entry += 2)
+      if (hasLabelAt(Entry) || ExternallyReferencedOffsets.count(Entry))
+        return true;
+    return false;
+  };
 
   // Ignore pseudo functions.
   if (isPseudo())
@@ -1674,6 +1682,14 @@ bool BinaryFunction::scanExternalRefs() {
       BinaryFunction *TargetFunction =
           BC.getBinaryFunctionContainingAddress(TargetAddress);
 
+      // Remember entries into fixed code even when no relocation is needed.
+      // In particular, a branch to the JALR of a CALL pair prevents updating
+      // that pair independently of the incoming branch's register state.
+      if (BC.isRISCV() && TargetFunction &&
+          TargetAddress != TargetFunction->getAddress() &&
+          (TargetFunction == this || !BC.shouldEmit(*TargetFunction)))
+        TargetFunction->getOrCreateLocalLabel(TargetAddress);
+
       if (!TargetFunction || ignoreFunctionRef(*TargetFunction))
         continue;
 
@@ -1692,6 +1708,15 @@ bool BinaryFunction::scanExternalRefs() {
     if (!BC.HasRelocations)
       continue;
 
+    // A fixed RISC-V short branch or relaxed call cannot be extended in place.
+    // Unlike an x86 entry jump, a RISC-V entry patch needs a scratch register,
+    // which may be live across a hand-written assembly helper. Keep the target
+    // instead of falling back to such a patch.
+    if (BC.isRISCV() && BranchTargetSymbol) {
+      FixedTargets.insert(BC.getFunctionForSymbol(BranchTargetSymbol));
+      continue;
+    }
+
     if (BranchTargetSymbol) {
       BC.MIB->replaceBranchTarget(Instruction, BranchTargetSymbol,
                                   Emitter.LocalCtx.get());
@@ -1704,6 +1729,32 @@ bool BinaryFunction::scanExternalRefs() {
           });
       if (!NeedsPatch)
         continue;
+
+      // An unrelaxed RISC-V call is symbolized at its AUIPC. Its relocation
+      // updates the complete AUIPC/JALR pair without changing either register
+      // operand or instruction size. Other address materialization sequences
+      // need HI/LO data-flow tracking and must keep their targets in place.
+      if (BC.isRISCV()) {
+        if (const MCSymbol *Target = BC.MIB->getTargetSymbol(Instruction)) {
+          if (BinaryFunction *TargetBF = BC.getFunctionForSymbol(Target)) {
+            MCInst Next;
+            uint64_t NextSize = 0;
+            if (Size != 4 || Offset + 8 > getSize() ||
+                hasRISCVCallInteriorEntry(Offset) ||
+                getSizeOfDataInCodeAt(Offset + 4) ||
+                getRelocationInRange(Offset + 4, Offset + 8) ||
+                !BC.DisAsm->getInstruction(Next, NextSize,
+                                           FunctionData.slice(Offset + 4),
+                                           AbsoluteInstrAddr + 4, nulls()) ||
+                NextSize != 4 || !BC.MIB->isRISCVCall(Instruction, Next) ||
+                Instruction.getOperand(0).getReg() !=
+                    Next.getOperand(1).getReg()) {
+              FixedTargets.insert(TargetBF);
+              continue;
+            }
+          }
+        }
+      }
     }
 
     // For AArch64, we need to undo relaxation done by the linker if the target
@@ -1818,14 +1869,34 @@ bool BinaryFunction::scanExternalRefs() {
 
     // Create relocation for every fixup.
     for (const MCFixup &Fixup : Fixups) {
+      // The original call pair is kept at its original size. Linker relaxation
+      // markers do not describe a value to update in that pair.
+      if (BC.isRISCV() && Fixup.getKind() == ELF::R_RISCV_RELAX)
+        continue;
       std::optional<Relocation> Rel = BC.MIB->createRelocation(Fixup, *BC.MAB);
       if (!Rel) {
+        if (BC.isRISCV()) {
+          if (const MCSymbol *Target = BC.MIB->getTargetSymbol(Instruction)) {
+            if (BinaryFunction *TargetBF = BC.getFunctionForSymbol(Target)) {
+              FixedTargets.insert(TargetBF);
+              continue;
+            }
+          }
+        }
         Success = false;
         continue;
       }
 
       if (ignoreReference(Rel->Symbol))
         continue;
+
+      // Interior function references should have been resolved to secondary
+      // entry symbols. A remaining addend cannot follow reordered blocks.
+      if (BC.isRISCV() && Rel->Addend)
+        if (BinaryFunction *Target = BC.getFunctionForSymbol(Rel->Symbol)) {
+          FixedTargets.insert(Target);
+          continue;
+        }
 
       if (Relocation::getSizeForType(Rel->Type) < 4) {
         // If the instruction uses a short form, then we might not be able
@@ -1857,9 +1928,26 @@ bool BinaryFunction::scanExternalRefs() {
   BC.SymbolicDisAsm->setSymbolizer(nullptr);
 
   // Add relocations unless disassembly failed for this function.
-  if (!DisassemblyFailed)
-    for (Relocation &Rel : FunctionRelocations)
+  if (!DisassemblyFailed) {
+    for (Relocation &Rel : FunctionRelocations) {
+      // A later branch in this scan may have exposed an overlapping entry.
+      if (BC.isRISCV() &&
+          (Rel.Type == ELF::R_RISCV_CALL ||
+           Rel.Type == ELF::R_RISCV_CALL_PLT) &&
+          hasRISCVCallInteriorEntry(
+              Rel.Offset + getOriginSection()->getAddress() - getAddress())) {
+        if (BinaryFunction *Target = BC.getFunctionForSymbol(Rel.Symbol))
+          FixedTargets.insert(Target);
+        continue;
+      }
       getOriginSection()->addPendingRelocation(Rel);
+    }
+  } else if (BC.isRISCV())
+    // No relocations will repair these calls if decoding failed later in the
+    // source. Preserve their targets before discarding the collected records.
+    for (const Relocation &Rel : FunctionRelocations)
+      if (BinaryFunction *Target = BC.getFunctionForSymbol(Rel.Symbol))
+        FixedTargets.insert(Target);
 
   // Add patches grouping them together.
   if (!InstructionPatches.empty()) {
@@ -1890,6 +1978,12 @@ bool BinaryFunction::scanExternalRefs() {
   // Apply target state only after the complete source has been scanned. The
   // source is either already ignored or is marked ignored by the caller.
   for (BinaryFunction *Target : InvalidTargets)
+    if (!Target->isIgnored())
+      Target->setIgnored();
+
+  // setIgnored() can recursively scan a target and replace the disassembler's
+  // symbolizer. Defer it until the source's complete scan has finished.
+  for (BinaryFunction *Target : FixedTargets)
     if (!Target->isIgnored())
       Target->setIgnored();
 

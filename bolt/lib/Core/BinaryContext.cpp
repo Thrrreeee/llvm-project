@@ -1543,6 +1543,30 @@ void BinaryContext::processInterproceduralReferences() {
     }
   }
 
+  // A fixed RISC-V CALL relocation updates both AUIPC and JALR. Some entries
+  // into the JALR are only discovered after its source has been scanned. Such
+  // entries may supply a different base register value, so keep the callee
+  // instead of changing the shared low immediate. Collect targets before
+  // setIgnored() can recursively add more pending relocations.
+  if (isRISCV()) {
+    for (const BinarySection &Section : sections()) {
+      for (const Relocation &Rel : Section.getPendingRelocations()) {
+        if (Rel.Type != ELF::R_RISCV_CALL && Rel.Type != ELF::R_RISCV_CALL_PLT)
+          continue;
+        const uint64_t Address = Section.getAddress() + Rel.Offset;
+        const BinaryFunction *Source =
+            getBinaryFunctionContainingAddress(Address);
+        if (!Source)
+          continue;
+        const uint64_t Offset = Address - Source->getAddress();
+        for (uint64_t Entry = Offset + 2; Entry < Offset + 8; Entry += 2)
+          if (Source->hasLabelAt(Entry))
+            if (BinaryFunction *Target = getFunctionForSymbol(Rel.Symbol))
+              InvalidFunctions.insert(Target);
+      }
+    }
+  }
+
   // Defer applying state changes until the entire validation scan is complete.
   // Ignoring a function during the scan may lead to missed references or
   // targets.

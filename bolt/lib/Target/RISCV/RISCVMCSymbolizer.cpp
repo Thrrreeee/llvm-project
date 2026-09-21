@@ -131,8 +131,8 @@ bool RISCVMCSymbolizer::trySymbolizeLinkerResolvedControlTransfer(
   // relocations. Decode the following JALR and attach a call expression to the
   // AUIPC before function reordering can move the caller relative to the
   // callee.
-  if (Inst.getOpcode() != RISCV::AUIPC || !CreateNewSymbols ||
-      !BC.TheTriple->isRISCV64() || InstOffset + 8 > Function.getSize() ||
+  if (Inst.getOpcode() != RISCV::AUIPC || !BC.TheTriple->isRISCV64() ||
+      InstOffset + 8 > Function.getSize() ||
       Function.getRelocationInRange(InstOffset, InstOffset + 8))
     return false;
 
@@ -162,18 +162,34 @@ bool RISCVMCSymbolizer::trySymbolizeLinkerResolvedControlTransfer(
   // JALR with rd=x0 is a no-link jump. It is a tail call only when it
   // transfers control to another function; a target in the current function
   // is an intraprocedural long jump and must not be represented as a call.
-  if (JALR.getOperand(0).getReg() == RISCV::X0 && TargetBF == &Function)
+  if (JALR.getOperand(0).getReg() == RISCV::X0 && TargetBF == &Function) {
+    if (!CreateNewSymbols)
+      BC.handleExternalBranchTarget(Target, Function, Function);
     return false;
+  }
 
-  BC.addInterproceduralReference(&Function, Target);
+  // Fixed functions need the same recovered expression when scanning their
+  // external references. They are not part of the subsequent CFG validation.
+  if (CreateNewSymbols)
+    BC.addInterproceduralReference(&Function, Target);
   MCSymbol *TargetSymbol =
       BC.handleExternalBranchTarget(Target, Function, *TargetBF);
-  if (!TargetSymbol)
+  if (!TargetSymbol && CreateNewSymbols)
     return false;
 
-  const MCExpr *Expr = MCSymbolRefExpr::create(TargetSymbol, *Ctx);
-  Inst.addOperand(MCOperand::createExpr(
-      BC.MIB->getTargetExprFor(Inst, Expr, *Ctx, ELF::R_RISCV_CALL_PLT)));
+  // Do not lose an invalid target while scanning a fixed function. Expose an
+  // ordinary address reference so the scanner preserves the function instead
+  // of trying to relocate this invalid control transfer.
+  const bool ValidTarget = TargetSymbol != nullptr;
+  const MCExpr *Expr = MCSymbolRefExpr::create(
+      ValidTarget ? TargetSymbol : TargetBF->getSymbol(), *Ctx);
+  if (!ValidTarget && Target != TargetBF->getAddress())
+    Expr = MCBinaryExpr::createAdd(
+        Expr, MCConstantExpr::create(Target - TargetBF->getAddress(), *Ctx),
+        *Ctx);
+  Inst.addOperand(MCOperand::createExpr(BC.MIB->getTargetExprFor(
+      Inst, Expr, *Ctx,
+      ValidTarget ? ELF::R_RISCV_CALL_PLT : ELF::R_RISCV_PCREL_HI20)));
   return true;
 }
 

@@ -55,8 +55,14 @@ const MCExpr *MCAsmInfo::getExprForFDESymbol(const MCSymbol *Sym,
 
   if (!(Encoding & dwarf::DW_EH_PE_pcrel))
     return Res;
-  if (DwarfFDERelSymbolSpec) {
-    assert(Encoding & dwarf::DW_EH_PE_sdata4 && "Unexpected encoding");
+  const unsigned Format = Encoding & 0x0f;
+  // The target specifiers currently represent 32-bit PC-relative relocations.
+  // Wider encodings need the full symbol difference, not an absolute fixup
+  // produced by applying a 32-bit specifier to an eight-byte data field.
+  if (DwarfFDERelSymbolSpec &&
+      (Format == dwarf::DW_EH_PE_sdata4 || Format == dwarf::DW_EH_PE_udata4 ||
+       ((Format == dwarf::DW_EH_PE_absptr || Format == dwarf::DW_EH_PE_signed) &&
+        CodePointerSize == 4))) {
     return MCSpecifierExpr::create(Res, DwarfFDERelSymbolSpec, Context);
   }
 

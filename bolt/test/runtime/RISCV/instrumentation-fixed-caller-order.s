@@ -24,7 +24,7 @@
 
 # CHECK: kept 1 LR/SC functions
 # CHECK: RISC-V far-data placement
-# CHECK: RISC-V fixed-call placement: 3 functions ordered by call-range deadlines
+# CHECK: RISC-V fixed-code placement: 3 functions ordered by PC-relative deadlines
 # CHECK: RISC-V far-data placement changes the requested function order
 # OFF-NOT: RISC-V far-data placement
 # PROFILE-DAG: 1 direct_caller {{[0-9a-f]+}} 1 fixed_leaf 0 0 1{{$}}

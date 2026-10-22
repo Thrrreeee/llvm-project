@@ -433,9 +433,12 @@ public:
   /// Targets of complete call pairs patched in original RISC-V code. Resolve
   /// the symbols after ICF so placement follows the surviving functions.
   DenseSet<const MCSymbol *> RISCVFixedCallTargets;
-  /// Minimum original callee address for each caller of fixed RISC-V code.
-  /// Keep caller symbols so ICF can redirect their placement constraints.
-  DenseMap<const MCSymbol *, uint64_t> RISCVFixedCalleeCallers;
+  /// Conservative minimum original target address for each function referring
+  /// to fixed RISC-V code. Keep user symbols so ICF can redirect constraints.
+  DenseMap<const MCSymbol *, uint64_t> RISCVFixedCodeUsers;
+  /// Collect a CALL or PCREL_HI20 placement bound for a fixed code target.
+  void recordRISCVFixedCodeReference(const BinaryFunction &BF,
+                                     const MCInst &Inst);
   /// Minimum original source address of an entry patch to each moved symbol.
   DenseMap<const MCSymbol *, uint64_t> RISCVEntryPatchTargets;
   /// Preserve input FDEs at their original addresses when moving their PC32

@@ -141,25 +141,15 @@ Error PatchEntries::runOnFunctions(BinaryContext &BC) {
 
   if (HadPatchabilityFailure && BC.isRISCV() && BC.KeepOriginalEHFrame) {
     // A failed patch can retain a previously movable callee, including via
-    // transitive external-reference scans. Refresh incoming-call constraints
+    // transitive external-reference scans. Refresh incoming code references
     // after that closure; the earlier far-data scan could not see these
     // targets. Avoid another full instruction scan when no patch failed.
     for (auto &[Address, Caller] : BC.getBinaryFunctions()) {
       if (!BC.shouldEmit(Caller) || !Caller.hasCFG())
         continue;
       for (const BinaryBasicBlock &BB : Caller)
-        for (const MCInst &Inst : BB) {
-          if (!BC.MIB->isCall(Inst) || BC.MIB->isIndirectCall(Inst))
-            continue;
-          const BinaryFunction *Target =
-              BC.getFunctionForSymbol(BC.MIB->getTargetSymbol(Inst));
-          if (!Target || BC.shouldEmit(*Target))
-            continue;
-          auto [It, Inserted] = BC.RISCVFixedCalleeCallers.try_emplace(
-              Caller.getSymbol(), Target->getAddress());
-          if (!Inserted)
-            It->second = std::min(It->second, Target->getAddress());
-        }
+        for (const MCInst &Inst : BB)
+          BC.recordRISCVFixedCodeReference(Caller, Inst);
     }
   }
 

@@ -35,6 +35,7 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/MCSymbol.h"
+#include "llvm/MC/MCValue.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
@@ -1741,6 +1742,54 @@ void BinaryContext::processFixedReferences(bool EntriesComplete) {
     Source.getOriginSection()->addPendingRelocation(Reference.Rel);
   }
   FixedReferences.clear();
+}
+
+void BinaryContext::recordRISCVFixedCodeReference(const BinaryFunction &BF,
+                                                  const MCInst &Inst) {
+  const MCExpr *Expr = MIB->getRISCVPCRelHi20Expr(Inst);
+  if (!Expr) {
+    if (!MIB->isCall(Inst) || MIB->isIndirectCall(Inst))
+      return;
+    const MCSymbol *TargetSymbol = MIB->getTargetSymbol(Inst);
+    if (!TargetSymbol)
+      return;
+    for (unsigned I = 0, E = MCPlus::getNumPrimeOperands(Inst); I != E; ++I) {
+      const MCOperand &Operand = Inst.getOperand(I);
+      if (!Operand.isExpr())
+        continue;
+      const MCExpr *Candidate = Operand.getExpr();
+      while (const auto *Specifier = dyn_cast<MCSpecifierExpr>(Candidate))
+        Candidate = Specifier->getSubExpr();
+      MCValue Value;
+      if (Candidate->evaluateAsRelocatable(Value, nullptr) &&
+          Value.getAddSym() == TargetSymbol && !Value.getSubSym() &&
+          !Value.getSpecifier()) {
+        Expr = Candidate;
+        break;
+      }
+    }
+  }
+  if (!Expr)
+    return;
+  MCValue Value;
+  if (!Expr->evaluateAsRelocatable(Value, nullptr) || !Value.getAddSym() ||
+      Value.getSubSym() || Value.getSpecifier())
+    return;
+  const BinaryFunction *Target = getFunctionForSymbol(Value.getAddSym());
+  if (!Target || shouldEmit(*Target))
+    return;
+
+  // CALL and PCREL_HI20 both require a signed 32-bit (delta + 0x800).
+  // The function start is a conservative bound for aliases, secondary entries
+  // and positive addends. Negative addends tighten it; unsigned subtraction
+  // also handles INT64_MIN without negating a signed minimum value.
+  uint64_t Address = Target->getAddress();
+  if (Value.getConstant() < 0)
+    Address -= std::min(Address, uint64_t(0) - Value.getConstant());
+  auto [It, Inserted] =
+      RISCVFixedCodeUsers.try_emplace(BF.getSymbol(), Address);
+  if (!Inserted)
+    It->second = std::min(It->second, Address);
 }
 
 void BinaryContext::postProcessSymbolTable() {

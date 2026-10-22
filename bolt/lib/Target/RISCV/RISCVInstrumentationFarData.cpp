@@ -223,19 +223,7 @@ Error RISCVInstrumentationFarData::runOnFunctions(BinaryContext &BC) {
     for (const BinaryBasicBlock &BB : BF)
       for (const MCInst &Inst : BB) {
         HasLRSC |= BC.MIB->isRISCVLRSC(Inst);
-        if (!BC.MIB->isCall(Inst) || BC.MIB->isIndirectCall(Inst))
-          continue;
-        const MCSymbol *Symbol = BC.MIB->getTargetSymbol(Inst);
-        const BinaryFunction *Target = BC.getFunctionForSymbol(Symbol);
-        if (!Target || BC.shouldEmit(*Target))
-          continue;
-        // Calls to preserved input code still use a signed AUIPC/JALR pair.
-        // The function start is a conservative lower bound for secondary
-        // entries, whose original instruction offsets cannot move either.
-        auto [It, Inserted] = BC.RISCVFixedCalleeCallers.try_emplace(
-            BF.getSymbol(), Target->getAddress());
-        if (!Inserted)
-          It->second = std::min(It->second, Target->getAddress());
+        BC.recordRISCVFixedCodeReference(BF, Inst);
       }
     // Adding even one ordinary load between LR and SC can invalidate a
     // constrained reservation loop. Keep all such functions unmodified here.

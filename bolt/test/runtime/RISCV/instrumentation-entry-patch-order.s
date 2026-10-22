@@ -25,10 +25,10 @@
 # CHECK: kept 2 LR/SC functions
 # CHECK: failed to patch entries in tiny
 # CHECK: RISC-V far-data placement: 2 functions placed before remaining emitted functions
-# CHECK: RISC-V fixed-call placement: 6 functions ordered by call-range deadlines
+# CHECK: RISC-V fixed-code placement: 6 functions ordered by PC-relative deadlines
 # CHECK: RISC-V far-data placement changes the requested function order
 # OFF: failed to patch entries in tiny
-# OFF-NOT: RISC-V fixed-call placement
+# OFF-NOT: RISC-V fixed-code placement
 # PROFILE-DAG: 1 main {{[0-9a-f]+}} 1 {{entry_early|entry_alias}} 0 0 1{{$}}
 # PROFILE-DAG: 0 [unknown] 0 1 {{entry_early|entry_alias}} 8 0 1{{$}}
 # PROFILE-DAG: 1 late_caller {{[0-9a-f]+}} 1 tiny 0 0 1{{$}}

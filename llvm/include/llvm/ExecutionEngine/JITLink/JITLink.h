@@ -1310,11 +1310,15 @@ public:
                             orc::ExecutorAddr Address,
                             orc::ExecutorAddrDiff Size, Linkage L, Scope S,
                             bool IsLive) {
+#ifdef EXPENSIVE_CHECKS
+    // Scanning all existing symbols on every insertion makes graph creation
+    // quadratic. Keep this check out of ordinary assertion-enabled builds.
     assert((S == Scope::Local || llvm::none_of(AbsoluteSymbols,
                                                [&](const Symbol *Sym) {
                                                  return Sym->getName() == Name;
                                                })) &&
            "Duplicate absolute symbol");
+#endif
     auto &Sym = Symbol::constructAbsolute(Allocator, createAddressable(Address),
                                           std::move(Name), Size, L, S, IsLive);
     AbsoluteSymbols.insert(&Sym);
@@ -1350,11 +1354,15 @@ public:
                            orc::SymbolStringPtr Name,
                            orc::ExecutorAddrDiff Size, Linkage L, Scope S,
                            bool IsCallable, bool IsLive) {
+#ifdef EXPENSIVE_CHECKS
+    // Large objects can contain millions of named definitions. Repeatedly
+    // walking the entire graph is only appropriate for expensive checking.
     assert((S == Scope::Local || llvm::none_of(defined_symbols(),
                                                [&](const Symbol *Sym) {
                                                  return Sym->getName() == Name;
                                                })) &&
            "Duplicate defined symbol");
+#endif
     auto &Sym =
         Symbol::constructNamedDef(Allocator, Content, Offset, std::move(Name),
                                   Size, L, S, IsLive, IsCallable);

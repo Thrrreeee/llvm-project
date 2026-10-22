@@ -7,15 +7,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Core/BinaryContext.h"
+#include "bolt/Core/Exceptions.h"
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
+#include "llvm/DebugInfo/DWARF/DWARFDebugFrame.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "gtest/gtest.h"
+#include <array>
 
 using namespace llvm;
 using namespace llvm::object;
@@ -73,6 +76,61 @@ protected:
 };
 
 } // namespace
+
+TEST_P(BinaryContextTester, EHFrameHeaderPlacementRange) {
+  const auto Arch = GetParam();
+  CFIReaderWriter Writer(
+      *BC, std::make_unique<DWARFDebugFrame>(Arch, true),
+      DWARFDataExtractor(StringRef(), true, 8));
+  DWARFDebugFrame Empty(Arch, true);
+  std::vector<std::array<char, 44>> FrameBytes;
+  FrameBytes.reserve(3);
+  auto makeFrame = [&](uint64_t Address, uint64_t PC) {
+    // A version-1 CIE with absolute eight-byte PCs, followed by one FDE.
+    auto &Bytes = FrameBytes.emplace_back();
+    support::endian::write32le(Bytes.data(), 12);
+    Bytes[8] = 1;
+    Bytes[10] = 1;
+    Bytes[11] = 0x78; // Data alignment -8.
+    Bytes[12] = 1;
+    support::endian::write32le(Bytes.data() + 16, 20);
+    support::endian::write32le(Bytes.data() + 20, 20);
+    support::endian::write64le(Bytes.data() + 24, PC);
+    support::endian::write64le(Bytes.data() + 32, 4);
+    auto Frame = std::make_unique<DWARFDebugFrame>(Arch, true, Address);
+    cantFail(Frame->parse(DWARFDataExtractor(
+        StringRef(Bytes.data(), Bytes.size()), true, 8)));
+    return Frame;
+  };
+  const auto Old = makeFrame(0x1000, 0x2000);
+  const auto New = makeFrame(0x100000000, 0x90000000);
+  uint64_t Min = 0, Max = 0;
+  Writer.generateEHFrameHeader(*Old, *New, 0, &Min, &Max);
+  EXPECT_EQ(Min, 0x80000011u);
+  EXPECT_EQ(Max, 0x80001010u);
+  for (uint64_t Address : {Min, Max}) {
+    const auto Header = Writer.generateEHFrameHeader(*Old, *New, Address);
+    EXPECT_EQ(Header[3], dwarf::DW_EH_PE_datarel | dwarf::DW_EH_PE_sdata4);
+  }
+  for (uint64_t Address : {Min - 1, Max + 1}) {
+    const auto Header = Writer.generateEHFrameHeader(*Old, *New, Address);
+    EXPECT_EQ(Header[3], dwarf::DW_EH_PE_datarel | dwarf::DW_EH_PE_sdata8);
+  }
+  const auto TooFar = makeFrame(0x200000000, 0x90000000);
+  Writer.generateEHFrameHeader(*Old, *TooFar, 0, &Min, &Max);
+  EXPECT_GT(Min, Max);
+
+  // The EH pointer is relative to header+4, not to the table's base. Its
+  // feasible base interval must also saturate at either address-space end.
+  DWARFDebugFrame Low(Arch, true, 0x20);
+  Writer.generateEHFrameHeader(Empty, Low, 0, &Min, &Max);
+  EXPECT_EQ(Min, 0u);
+  EXPECT_EQ(Max, 0x8000001cu);
+  DWARFDebugFrame High(Arch, true, UINT64_MAX - 16);
+  Writer.generateEHFrameHeader(Empty, High, UINT64_MAX - 16, &Min, &Max);
+  EXPECT_EQ(Min, UINT64_MAX - 16 - (uint64_t(INT32_MAX) + 4));
+  EXPECT_EQ(Max, UINT64_MAX);
+}
 
 #ifdef X86_AVAILABLE
 

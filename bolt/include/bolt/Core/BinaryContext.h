@@ -309,6 +309,8 @@ class BinaryContext {
   bool FixedReferenceEntriesComplete{false};
   bool ProcessingFixedReferences{false};
 
+  DenseMap<uint64_t, size_t> RISCVFarDataSlotIndices;
+
 public:
   static Expected<std::unique_ptr<BinaryContext>> createBinaryContext(
       Triple TheTriple, std::shared_ptr<orc::SymbolStringPool> SSP,
@@ -417,6 +419,33 @@ public:
 
   /// Newly created segments.
   std::vector<SegmentInfo> NewSegments;
+
+  /// Runtime-relocated original AUIPC bases used by RISC-V instrumentation.
+  /// These are input addresses, not targets to translate with moved code/data.
+  struct RISCVFarDataSlot {
+    MCSymbol *Label;
+    uint64_t OriginalBase;
+    uint64_t Offset{0};
+  };
+  std::vector<RISCVFarDataSlot> RISCVFarDataSlots;
+  bool SupportsRISCVFarDataSlots{false};
+  DenseSet<const BinaryFunction *> RISCVFarDataEarlyFunctions;
+  /// Preserve input FDEs at their original addresses when moving their PC32
+  /// references to the output allocation would exceed the encoding's range.
+  bool KeepOriginalEHFrame{false};
+
+  /// Called by the serial RISC-V address legalization pass.
+  MCSymbol *getOrCreateRISCVFarDataSlot(uint64_t OriginalBase) {
+    // AUIPC is at least two-byte aligned and adds a multiple of 4096. Shifting
+    // the key also keeps both DenseMap sentinel values outside the key range.
+    assert(!(OriginalBase & 1) && "unaligned original AUIPC base");
+    auto [It, Inserted] = RISCVFarDataSlotIndices.try_emplace(
+        OriginalBase >> 1, RISCVFarDataSlots.size());
+    if (Inserted)
+      RISCVFarDataSlots.push_back(
+          {Ctx->createNamedTempSymbol("far_data"), OriginalBase});
+    return RISCVFarDataSlots[It->second].Label;
+  }
 
   /// [name] -> [BinaryData*] map used for global symbol resolution.
   ///

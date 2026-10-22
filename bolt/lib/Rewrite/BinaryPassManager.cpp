@@ -34,6 +34,9 @@
 #include "bolt/Passes/ReorderData.h"
 #include "bolt/Passes/ReorderFunctions.h"
 #include "bolt/Passes/RetpolineInsertion.h"
+#ifdef RISCV_AVAILABLE
+#include "bolt/Passes/RISCVInstrumentationFarData.h"
+#endif
 #include "bolt/Passes/SplitFunctions.h"
 #include "bolt/Passes/StokeInfo.h"
 #include "bolt/Passes/TailDuplication.h"
@@ -394,6 +397,12 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
     Manager.registerPass(
         std::make_unique<FixRISCVCallsPass>(PrintFixRISCVCalls));
   }
+
+#ifdef RISCV_AVAILABLE
+  // Preserve original instruction offsets and bases before inlining or
+  // instrumentation can change the instructions' function ownership.
+  Manager.registerPass(std::make_unique<RISCVInstrumentationFarData>());
+#endif
 
   // Here we manage dependencies/order manually, since passes are run in the
   // order they're registered.

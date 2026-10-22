@@ -98,6 +98,9 @@ extern cl::opt<bool> TerminalHLT;
 extern cl::opt<bool> TerminalTrap;
 extern cl::opt<bool> TimeBuild;
 extern cl::opt<bool> TimeRewrite;
+#ifdef RISCV_AVAILABLE
+extern cl::opt<bool> RISCVInstrumentationFarData;
+#endif
 extern cl::opt<bolt::IdenticalCodeFolding::ICFLevel, false,
                llvm::bolt::DeprecatedICFNumericOptionParser>
     ICF;
@@ -705,6 +708,13 @@ Error RewriteInstance::discoverStorage(ELFObjectFile<ELFT> *ELFObjFile) {
 
   const ELFFile<ELFT> &Obj = ELFObjFile->getELFFile();
 
+#ifdef RISCV_AVAILABLE
+  if (opts::RISCVInstrumentationFarData && opts::UseGnuStack)
+    return createStringError(errc::invalid_argument,
+                             "--riscv-instrumentation-far-data does not "
+                             "support --use-gnu-stack");
+#endif
+
   BC->StartFunctionAddress = Obj.getHeader().e_entry;
 
   NextAvailableAddress = 0;
@@ -850,6 +860,12 @@ Error RewriteInstance::discoverStorage(ELFObjectFile<ELFT> *ELFObjFile) {
     // segment in instrumented binary.
     if (opts::Instrument)
       Phnum += 2;
+
+#ifdef RISCV_AVAILABLE
+    // A disjoint original .eh_frame can require a separately mapped header.
+    if (opts::RISCVInstrumentationFarData)
+      ++Phnum;
+#endif
 
     NextAvailableAddress +=
         Phnum * sizeof(typename ELFObjectFile<ELFT>::Elf_Phdr);
@@ -4471,7 +4487,13 @@ void RewriteInstance::emitAndLink() {
   std::unique_ptr<MCStreamer> Streamer = BC->createStreamer(OS);
 
   if (EHFrameSection) {
-    if (opts::UseOldText || opts::StrictMode) {
+    if (BC->KeepOriginalEHFrame) {
+      // The original PC-relative encodings remain valid at their input
+      // addresses. The new search table can index both disjoint frame areas.
+      if (BinarySection *Copy =
+              getSection(".relocated" + getEHFrameSectionName()))
+        BC->deregisterSection(*Copy);
+    } else if (opts::UseOldText || opts::StrictMode) {
       // The section is going to be regenerated from scratch.
       // Empty the contents, but keep the section reference.
       EHFrameSection->clearContents();
@@ -4594,6 +4616,58 @@ void RewriteInstance::updateMetadata() {
 
 void RewriteInstance::mapFileSections(BOLTLinker::SectionMapper MapSection) {
   BC->deregisterUnusedSections();
+
+  if (BC->KeepOriginalEHFrame && EHFrameSection) {
+    if (!BC->BOLTReserved.empty() || opts::UseOldText) {
+      BC->errs() << "BOLT-ERROR: preserving original EH frames requires a "
+                    "new output allocation\n";
+      exit(1);
+    }
+    if (BinarySection *NewEHFrameSection =
+            getSection(getNewSecPrefix() + getEHFrameSectionName())) {
+      // Count raw records before relocation. CIEs are included, providing a
+      // small upper bound without decoding CFI or retaining another frame map.
+      auto CountRecords = [&](StringRef Contents) {
+        DataExtractor Data(Contents, BC->AsmInfo->isLittleEndian());
+        uint64_t Offset = 0, Count = 0;
+        while (Data.isValidOffsetForDataOfSize(Offset, 4)) {
+          uint64_t Length = Data.getU32(&Offset);
+          if (!Length)
+            break;
+          if (Length == UINT32_MAX) {
+            if (!Data.isValidOffsetForDataOfSize(Offset, 8)) {
+              BC->errs() << "BOLT-ERROR: truncated EH frame record length\n";
+              exit(1);
+            }
+            Length = Data.getU64(&Offset);
+          }
+          if (!Data.isValidOffsetForDataOfSize(Offset, Length)) {
+            BC->errs() << "BOLT-ERROR: truncated EH frame record\n";
+            exit(1);
+          }
+          Offset += Length;
+          ++Count;
+        }
+        return Count;
+      };
+      const uint64_t NumRecords =
+          CountRecords(EHFrameSection->getContents()) +
+          CountRecords(NewEHFrameSection->getOutputContents());
+      const uint64_t PageSize = BC->RegularPageSize;
+      if (NumRecords > (UINT64_MAX - 12 - PageSize) / 8 ||
+          NextAvailableAddress > UINT64_MAX - (PageSize - 1)) {
+        BC->errs() << "BOLT-ERROR: EH frame header reservation is too large\n";
+        exit(1);
+      }
+      EHFrameHdrReservedAddress = alignTo(NextAvailableAddress, PageSize);
+      EHFrameHdrReservedSize = alignTo(12 + NumRecords * 8, PageSize);
+      if (EHFrameHdrReservedAddress > UINT64_MAX - EHFrameHdrReservedSize) {
+        BC->errs() << "BOLT-ERROR: EH frame header reservation overflows\n";
+        exit(1);
+      }
+      NextAvailableAddress = EHFrameHdrReservedAddress + EHFrameHdrReservedSize;
+    }
+  }
 
   // If no new .eh_frame was written, remove relocated original .eh_frame.
   BinarySection *RelocatedEHFrameSection =
@@ -4921,7 +4995,7 @@ void RewriteInstance::mapCodeSectionsInPlace(
 void RewriteInstance::mapAllocatableSections(
     BOLTLinker::SectionMapper MapSection) {
 
-  if (opts::UseOldText || opts::StrictMode) {
+  if ((opts::UseOldText || opts::StrictMode) && !BC->KeepOriginalEHFrame) {
     auto tryRewriteSection = [&](BinarySection &OldSection,
                                  BinarySection &NewSection) {
       if (OldSection.getSize() < NewSection.getOutputSize())
@@ -5106,6 +5180,9 @@ void RewriteInstance::updateSegmentInfo() {
         true};
     BC->NewSegments.push_back(DataSegmentInfo);
   }
+
+  if (EHFrameHdrSegment)
+    BC->NewSegments.push_back(*EHFrameHdrSegment);
 }
 
 template <typename ELFT>
@@ -5220,6 +5297,22 @@ void RewriteInstance::patchELFPHDRTable(ELFObjectFile<ELFT> *File) {
   auto InsertPos = LastPTLoad.base();
   for (const SegmentInfo &SI : BC->NewSegments)
     InsertPos = std::next(Phdrs.insert(InsertPos, createPhdr(SI)));
+
+  // A separately mapped EH header can occupy a hole between input segments.
+  // Preserve the non-load headers' positions while ordering every PT_LOAD.
+  if (EHFrameHdrSegment) {
+    SmallVector<PhdrTy, 16> LoadPhdrs;
+    for (const PhdrTy &Phdr : Phdrs)
+      if (Phdr.p_type == ELF::PT_LOAD)
+        LoadPhdrs.push_back(Phdr);
+    llvm::stable_sort(LoadPhdrs, [](const PhdrTy &A, const PhdrTy &B) {
+      return A.p_vaddr < B.p_vaddr;
+    });
+    auto NextLoad = LoadPhdrs.begin();
+    for (PhdrTy &Phdr : Phdrs)
+      if (Phdr.p_type == ELF::PT_LOAD)
+        Phdr = *NextLoad++;
+  }
 
   OS.write(reinterpret_cast<const char *>(Phdrs.data()),
            sizeof(PhdrTy) * Phdrs.size());
@@ -5579,6 +5672,13 @@ RewriteInstance::getOutputSections(ELFObjectFile<ELFT> *File,
     NewSection.sh_link = 0;
     NewSection.sh_info = 0;
     NewSection.sh_addralign = Section.getAlignment();
+    if (&Section == RISCVFarDataRelocationSection) {
+      NewSection.sh_type = ELF::SHT_RELA;
+      NewSection.sh_entsize = sizeof(typename ELFT::Rela);
+      // This is an input index; the common section-index remapping below
+      // translates it to the final dynamic symbol table index.
+      NewSection.sh_link = RISCVFarDataDynsymIndex;
+    }
     addSection(NewSection, Section);
   }
 
@@ -6443,6 +6543,61 @@ void RewriteInstance::patchELFAllocatableRelrSection(
 }
 
 template <typename ELFT>
+void RewriteInstance::prepareRISCVFarDataRelocations(
+    ELFObjectFile<ELFT> *File) {
+  if (BC->RISCVFarDataSlots.empty())
+    return;
+
+  assert(BC->SupportsRISCVFarDataSlots && DynamicRelocationsAddress &&
+         "unsupported RISC-V dynamic address slots");
+  const ELFFile<ELFT> &EF = File->getELFFile();
+  const auto Sections = cantFail(EF.sections());
+  for (uint32_t I = 0; I != Sections.size(); ++I) {
+    if (Sections[I].sh_type == ELF::SHT_DYNSYM) {
+      RISCVFarDataDynsymIndex = I;
+      break;
+    }
+  }
+  assert(RISCVFarDataDynsymIndex && "dynamic symbol table is required");
+
+  constexpr uint64_t EntrySize = sizeof(typename ELFT::Rela);
+  const uint64_t NumSlots = BC->RISCVFarDataSlots.size();
+  if (NumSlots > (UINT64_MAX - DynamicRelocationsSize) / EntrySize) {
+    BC->errs() << "BOLT-ERROR: RISC-V dynamic relocation table is too large\n";
+    exit(1);
+  }
+  const uint64_t Size = DynamicRelocationsSize + NumSlots * EntrySize;
+  raw_fd_ostream &OS = Out->os();
+  OS.seek(getFileOffsetForAddress(NextAvailableAddress));
+  NextAvailableAddress = appendPadding(OS, NextAvailableAddress, 8);
+  const uint64_t Address = NextAvailableAddress;
+  if (Size > UINT64_MAX - Address ||
+      (!BC->BOLTReserved.empty() &&
+       (Address > BC->BOLTReserved.end() ||
+        Size > BC->BOLTReserved.end() - Address))) {
+    BC->errs() << "BOLT-ERROR: unable to fit RISC-V dynamic relocations "
+                  "into the output allocation\n";
+    exit(1);
+  }
+  NextAvailableAddress += Size;
+
+  // Keep the original allocation intact. Only the dynamic table pointers and
+  // section names change; PLT relocation indices continue to use their table.
+  ErrorOr<BinarySection &> Old =
+      BC->getSectionForAddress(*DynamicRelocationsAddress);
+  assert(Old && "missing original dynamic relocation section");
+  Old->setOutputName(getOrgSecPrefix() + ".rela.dyn");
+  const unsigned Flags = BinarySection::getFlags(
+      /*IsReadOnly=*/true, /*IsText=*/false, /*IsAllocatable=*/true);
+  RISCVFarDataRelocationSection = &BC->registerOrUpdateSection(
+      getNewSecPrefix() + ".rela.dyn", ELF::SHT_RELA, Flags, nullptr, Size, 8);
+  RISCVFarDataRelocationSection->setOutputName(".rela.dyn");
+  RISCVFarDataRelocationSection->setOutputAddress(Address);
+  RISCVFarDataRelocationSection->setOutputFileOffset(
+      getFileOffsetForAddress(Address));
+}
+
+template <typename ELFT>
 void
 RewriteInstance::patchELFAllocatableRelaSections(ELFObjectFile<ELFT> *File) {
   using Elf_Rela = typename ELFT::Rela;
@@ -6467,6 +6622,12 @@ RewriteInstance::patchELFAllocatableRelaSections(ELFObjectFile<ELFT> *File) {
   if (DynamicRelocationsAddress)
     setSectionFileOffsets(*DynamicRelocationsAddress, RelDynOffset,
                           RelDynEndOffset);
+
+  if (RISCVFarDataRelocationSection) {
+    RelDynOffset = RISCVFarDataRelocationSection->getOutputFileOffset();
+    RelDynEndOffset =
+        RelDynOffset + RISCVFarDataRelocationSection->getOutputSize();
+  }
 
   if (PLTRelocationsAddress)
     setSectionFileOffsets(*PLTRelocationsAddress, RelPltOffset,
@@ -6540,6 +6701,25 @@ RewriteInstance::patchELFAllocatableRelaSections(ELFObjectFile<ELFT> *File) {
   // The dynamic linker expects all R_*_RELATIVE relocations in RELA
   // to be emitted first.
   writeDynRelocations(/* PatchRelative */ true);
+  if (RISCVFarDataRelocationSection) {
+    ErrorOr<BinarySection &> Counters =
+        BC->getUniqueSectionByName(".bolt.instr.counters");
+    assert(Counters && "missing instrumentation counters section");
+    for (const BinaryContext::RISCVFarDataSlot &Slot : BC->RISCVFarDataSlots) {
+      Elf_Rela RelA;
+      RelA.setSymbolAndType(0, ELF::R_RISCV_RELATIVE, EF.isMips64EL());
+      RelA.r_offset = Counters->getOutputAddress() + Slot.Offset;
+      // This is the original AUIPC base, which need not be an object address.
+      // Translating it as a moved function/data target would change semantics.
+      RelA.r_addend = Slot.OriginalBase;
+      assert(RelDynOffset <= RelDynEndOffset &&
+             sizeof(RelA) <= RelDynEndOffset - RelDynOffset &&
+             "new dynamic relocation table overflow");
+      writeRela(&RelA, RelDynOffset);
+      RelDynOffset += sizeof(RelA);
+      ++DynamicRelativeRelocationsCount;
+    }
+  }
   writeDynRelocations(/* PatchRelative */ false);
 
   auto fillNone = [&](uint64_t Offset, uint64_t EndOffset) {
@@ -6654,6 +6834,14 @@ void RewriteInstance::patchELFDynamic(ELFObjectFile<ELFT> *File) {
     case ELF::DT_RELACOUNT:
       NewDE.d_un.d_val = DynamicRelativeRelocationsCount;
       break;
+    case ELF::DT_RELA:
+      if (RISCVFarDataRelocationSection)
+        NewDE.d_un.d_ptr = RISCVFarDataRelocationSection->getOutputAddress();
+      break;
+    case ELF::DT_RELASZ:
+      if (RISCVFarDataRelocationSection)
+        NewDE.d_un.d_val = RISCVFarDataRelocationSection->getOutputSize();
+      break;
     case ELF::DT_INIT:
     case ELF::DT_FINI: {
       if (BC->HasRelocations) {
@@ -6745,6 +6933,9 @@ Error RewriteInstance::readELFDynamic(ELFObjectFile<ELFT> *File) {
     return DynamicEntriesOrErr.takeError();
   typename ELFT::DynRange DynamicEntries = DynamicEntriesOrErr.get();
 
+  bool HasRelaSize = false;
+  uint64_t RelaEntrySize = 0;
+
   for (const Elf_Dyn &Dyn : DynamicEntries) {
     switch (Dyn.d_tag) {
     case ELF::DT_FLAGS_1: {
@@ -6778,6 +6969,10 @@ Error RewriteInstance::readELFDynamic(ELFObjectFile<ELFT> *File) {
       break;
     case ELF::DT_RELASZ:
       DynamicRelocationsSize = Dyn.getVal();
+      HasRelaSize = true;
+      break;
+    case ELF::DT_RELAENT:
+      RelaEntrySize = Dyn.getVal();
       break;
     case ELF::DT_JMPREL:
       PLTRelocationsAddress = Dyn.getPtr();
@@ -6822,6 +7017,13 @@ Error RewriteInstance::readELFDynamic(ELFObjectFile<ELFT> *File) {
                << "by RELR entry size\n";
     exit(1);
   }
+
+  BC->SupportsRISCVFarDataSlots =
+      BC->TheTriple->isRISCV64() && !BC->IsStaticExecutable &&
+      !BC->HasFixedLoadAddress && BC->HasInterpHeader &&
+      DynamicRelocationsAddress && HasRelaSize &&
+      RelaEntrySize == sizeof(typename ELFT::Rela) &&
+      DynamicRelocationsSize % RelaEntrySize == 0 && !DynamicRelrAddress;
 
   return Error::success();
 }
@@ -7100,6 +7302,9 @@ void RewriteInstance::rewriteFile() {
       return getNewValueForSymbol(S->getName());
     });
 
+  // Reserve all appended allocatable data before choosing a header VMA hole.
+  prepareRISCVFarDataRelocations();
+
   // If .eh_frame is present create .eh_frame_hdr.
   if (EHFrameSection)
     writeEHFrameHeader();
@@ -7181,7 +7386,10 @@ void RewriteInstance::writeEHFrameHeader() {
   StringRef RelocatedEHFrameContents;
   BinarySection *RelocatedEHFrameSection =
       getSection(".relocated" + getEHFrameSectionName());
-  if (RelocatedEHFrameSection) {
+  if (BC->KeepOriginalEHFrame) {
+    RelocatedEHFrameAddress = EHFrameSection->getAddress();
+    RelocatedEHFrameContents = EHFrameSection->getContents();
+  } else if (RelocatedEHFrameSection) {
     RelocatedEHFrameAddress = RelocatedEHFrameSection->getOutputAddress();
     RelocatedEHFrameContents = RelocatedEHFrameSection->getOutputContents();
   }
@@ -7198,12 +7406,17 @@ void RewriteInstance::writeEHFrameHeader() {
   // Try to overwrite the original .eh_frame_hdr if the size permits.
   uint64_t EHFrameHdrOutputAddress = 0;
   uint64_t EHFrameHdrFileOffset = 0;
+  uint64_t SData4BaseMin = 0, SData4BaseMax = UINT64_MAX;
   std::vector<char> NewEHFrameHdr;
   BinarySection *OldEHFrameHdrSection = getSection(getEHFrameHdrSectionName());
   if (OldEHFrameHdrSection) {
     NewEHFrameHdr = CFIRdWrt->generateEHFrameHeader(
-        RelocatedEHFrame, NewEHFrame, OldEHFrameHdrSection->getAddress());
-    if (NewEHFrameHdr.size() <= OldEHFrameHdrSection->getSize()) {
+        RelocatedEHFrame, NewEHFrame, OldEHFrameHdrSection->getAddress(),
+        &SData4BaseMin, &SData4BaseMax);
+    if (NewEHFrameHdr.size() <= OldEHFrameHdrSection->getSize() &&
+        (!BC->KeepOriginalEHFrame ||
+         NewEHFrameHdr[3] ==
+             (dwarf::DW_EH_PE_datarel | dwarf::DW_EH_PE_sdata4))) {
       BC->outs() << "BOLT-INFO: rewriting " << getEHFrameHdrSectionName()
                  << " in-place\n";
       EHFrameHdrOutputAddress = OldEHFrameHdrSection->getAddress();
@@ -7217,17 +7430,121 @@ void RewriteInstance::writeEHFrameHeader() {
 
   // If there was not enough space, allocate more memory for .eh_frame_hdr.
   if (!OldEHFrameHdrSection) {
-    Out->os().seek(getFileOffsetForAddress(NextAvailableAddress));
-    NextAvailableAddress =
-        appendPadding(Out->os(), NextAvailableAddress, EHFrameHdrAlign);
+    if (BC->KeepOriginalEHFrame) {
+      assert(EHFrameHdrReservedSize && "missing EH frame header reservation");
+      if (NewEHFrameHdr.empty())
+        NewEHFrameHdr = CFIRdWrt->generateEHFrameHeader(
+            RelocatedEHFrame, NewEHFrame, EHFrameHdrReservedAddress,
+            &SData4BaseMin, &SData4BaseMax);
 
-    EHFrameHdrOutputAddress = NextAvailableAddress;
-    EHFrameHdrFileOffset = getFileOffsetForAddress(NextAvailableAddress);
+      // libgcc implementations that only binary-search datarel32 tables fall
+      // back to a linear scan for datarel64. A scan of just the new frame area
+      // cannot find original FDEs, so preserving disjoint frames requires a
+      // header base from which every table entry is representable in 32 bits.
+      if (SData4BaseMin > SData4BaseMax) {
+        BC->errs() << "BOLT-ERROR: no common 32-bit EH frame header address "
+                      "range for original and emitted frames\n";
+        exit(1);
+      }
+      const bool Wide = NewEHFrameHdr[3] ==
+                        (dwarf::DW_EH_PE_datarel | dwarf::DW_EH_PE_sdata8);
+      DataExtractor HeaderData(
+          StringRef(NewEHFrameHdr.data(), NewEHFrameHdr.size()),
+          BC->AsmInfo->isLittleEndian());
+      uint64_t CountOffset = Wide ? 12 : 8;
+      const uint64_t HeaderSize =
+          12 + uint64_t(HeaderData.getU32(&CountOffset)) * 8;
+      if (HeaderSize > EHFrameHdrReservedSize) {
+        BC->errs()
+            << "BOLT-ERROR: EH frame header exceeds its reserved prefix\n";
+        exit(1);
+      }
+      EHFrameHdrFileOffset = getFileOffsetForAddress(EHFrameHdrReservedAddress);
+      EHFrameHdrOutputAddress = EHFrameHdrReservedAddress;
+      if (EHFrameHdrOutputAddress < SData4BaseMin ||
+          EHFrameHdrOutputAddress > SData4BaseMax) {
+        const uint64_t PageSize = BC->RegularPageSize;
+        const uint64_t MappingSize = alignTo(HeaderSize, PageSize);
+        SmallVector<std::pair<uint64_t, uint64_t>, 16> Occupied;
+        auto AddOccupied = [&](uint64_t Address, uint64_t Size) {
+          if (!Size)
+            return;
+          const uint64_t End =
+              Size > UINT64_MAX - Address ? UINT64_MAX : Address + Size;
+          Occupied.emplace_back(alignDown(Address, PageSize),
+                                End > UINT64_MAX - (PageSize - 1)
+                                    ? UINT64_MAX
+                                    : alignTo(End, PageSize));
+        };
+        for (const auto &[Address, Segment] : BC->SegmentMapInfo)
+          AddOccupied(Segment.Address, Segment.Size);
+        for (const SegmentInfo &Segment : BC->NewSegments)
+          AddOccupied(Segment.Address, Segment.Size);
+        // This allocation includes writable data and the replacement RELA
+        // table, which is reserved before entering writeEHFrameHeader().
+        // Keep the alias below the new allocation, including its future tail.
+        // Otherwise it could change the image end or collide with metadata
+        // appended after this point.
+        AddOccupied(NewTextSegmentAddress, UINT64_MAX - NewTextSegmentAddress);
+        llvm::sort(Occupied);
+        uint64_t Candidate = std::max(SData4BaseMin, BC->FirstAllocAddress);
+        bool Found = Candidate <= UINT64_MAX - (PageSize - 1);
+        if (Found)
+          Candidate = alignTo(Candidate, PageSize);
+        for (const auto &[Start, End] : Occupied) {
+          if (!Found || Candidate > SData4BaseMax)
+            break;
+          if (End <= Candidate)
+            continue;
+          if (Candidate <= Start && MappingSize <= Start - Candidate)
+            break;
+          if (End > UINT64_MAX - (PageSize - 1)) {
+            Found = false;
+            break;
+          }
+          Candidate = alignTo(End, PageSize);
+        }
+        Found &=
+            Candidate <= SData4BaseMax && MappingSize <= UINT64_MAX - Candidate;
+        if (!Found) {
+          BC->errs() << "BOLT-ERROR: no unoccupied virtual address range for "
+                        "a 32-bit EH frame header\n";
+          exit(1);
+        }
+        EHFrameHdrOutputAddress = Candidate;
+        // Reuse the reserved file pages in a separate read-only mapping. Their
+        // original RX mapping remains an unused read-only alias, avoiding a
+        // second file allocation and any conflict with appended metadata.
+        EHFrameHdrSegment = SegmentInfo{
+            Candidate, HeaderSize, EHFrameHdrFileOffset, HeaderSize, PageSize,
+            false,     false};
+        BC->outs() << "BOLT-INFO: mapping 32-bit EH frame header at 0x"
+                   << Twine::utohexstr(Candidate) << " in a separate read-only "
+                   << "segment\n";
+      } else {
+        BC->outs() << "BOLT-INFO: placing 32-bit EH frame header before new "
+                      "code at 0x"
+                   << Twine::utohexstr(EHFrameHdrOutputAddress) << '\n';
+      }
+      NewEHFrameHdr = CFIRdWrt->generateEHFrameHeader(
+          RelocatedEHFrame, NewEHFrame, EHFrameHdrOutputAddress);
+      assert(NewEHFrameHdr.size() == HeaderSize &&
+             NewEHFrameHdr[3] ==
+                 (dwarf::DW_EH_PE_datarel | dwarf::DW_EH_PE_sdata4) &&
+             "header address must permit 32-bit encodings");
+    } else {
+      Out->os().seek(getFileOffsetForAddress(NextAvailableAddress));
+      NextAvailableAddress =
+          appendPadding(Out->os(), NextAvailableAddress, EHFrameHdrAlign);
 
-    NewEHFrameHdr = CFIRdWrt->generateEHFrameHeader(
-        RelocatedEHFrame, NewEHFrame, EHFrameHdrOutputAddress);
+      EHFrameHdrOutputAddress = NextAvailableAddress;
+      EHFrameHdrFileOffset = getFileOffsetForAddress(NextAvailableAddress);
 
-    NextAvailableAddress += NewEHFrameHdr.size();
+      NewEHFrameHdr = CFIRdWrt->generateEHFrameHeader(
+          RelocatedEHFrame, NewEHFrame, EHFrameHdrOutputAddress);
+
+      NextAvailableAddress += NewEHFrameHdr.size();
+    }
     if (!BC->BOLTReserved.empty() &&
         (NextAvailableAddress > BC->BOLTReserved.end())) {
       BC->errs() << "BOLT-ERROR: unable to fit " << getEHFrameHdrSectionName()
@@ -7290,6 +7607,10 @@ uint64_t RewriteInstance::getNewValueForSymbol(const StringRef Name) {
 }
 
 uint64_t RewriteInstance::getFileOffsetForAddress(uint64_t Address) const {
+  if (EHFrameHdrSegment && Address >= EHFrameHdrSegment->Address &&
+      Address - EHFrameHdrSegment->Address < EHFrameHdrSegment->Size)
+    return Address - EHFrameHdrSegment->Address + EHFrameHdrSegment->FileOffset;
+
   // Check if it's possibly part of the new segment.
   if (NewTextSegmentAddress && Address >= NewTextSegmentAddress)
     return Address - NewTextSegmentAddress + NewTextSegmentOffset;

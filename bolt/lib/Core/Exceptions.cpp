@@ -725,7 +725,9 @@ bool CFIReaderWriter::fillCFIInfoFor(BinaryFunction &Function) const {
 std::vector<char>
 CFIReaderWriter::generateEHFrameHeader(const DWARFDebugFrame &OldEHFrame,
                                        const DWARFDebugFrame &NewEHFrame,
-                                       uint64_t EHFrameHeaderAddress) const {
+                                       uint64_t EHFrameHeaderAddress,
+                                       uint64_t *SData4BaseMin,
+                                       uint64_t *SData4BaseMax) const {
   // Common PC -> FDE map to be written into .eh_frame_hdr.
   std::map<uint64_t, uint64_t> PCToFDE;
 
@@ -775,6 +777,28 @@ CFIReaderWriter::generateEHFrameHeader(const DWARFDebugFrame &OldEHFrame,
 
   const int64_t EHFramePtr =
       NewEHFrame.getEHFrameAddress() - (EHFrameHeaderAddress + 4);
+
+  if (SData4BaseMin || SData4BaseMax) {
+    uint64_t Min = 0, Max = UINT64_MAX;
+    auto constrainBase = [&](uint64_t Target, uint64_t FieldOffset = 0) {
+      // Target - (Base + FieldOffset) must fit in signed 32 bits. Saturate
+      // the interval endpoints rather than wrapping at the address limits.
+      const uint64_t Below = uint64_t(INT32_MAX) + FieldOffset;
+      const uint64_t Above = (uint64_t(1) << 31) - FieldOffset;
+      Min = std::max(Min, Target > Below ? Target - Below : 0);
+      Max = std::min(Max, Target > UINT64_MAX - Above ? UINT64_MAX
+                                                     : Target + Above);
+    };
+    constrainBase(NewEHFrame.getEHFrameAddress(), 4);
+    for (const auto &[PC, FDE] : PCToFDE) {
+      constrainBase(PC);
+      constrainBase(FDE);
+    }
+    if (SData4BaseMin)
+      *SData4BaseMin = Min;
+    if (SData4BaseMax)
+      *SData4BaseMax = Max;
+  }
 
   // Switch to 8-byte encodings if any offset does not fit into 32 bits.
   const bool UseSData8 =

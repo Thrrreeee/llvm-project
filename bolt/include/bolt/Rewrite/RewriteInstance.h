@@ -364,6 +364,9 @@ private:
   /// Patch allocatable relocation sections.
   ELF_FUNCTION(void, patchELFAllocatableRelaSections);
 
+  /// Reserve a replacement dynamic RELA table for newly emitted data slots.
+  ELF_FUNCTION(void, prepareRISCVFarDataRelocations);
+
   /// Patch allocatable relr section.
   ELF_FUNCTION(void, patchELFAllocatableRelrSection);
 
@@ -536,10 +539,19 @@ private:
   /// Track next available address for new allocatable sections.
   uint64_t NextAvailableAddress{0};
 
+  /// Space reserved before new code for a 32-bit .eh_frame_hdr search table.
+  uint64_t EHFrameHdrReservedAddress{0};
+  uint64_t EHFrameHdrReservedSize{0};
+  /// Optional read-only mapping of those file pages at a reachable address.
+  std::optional<SegmentInfo> EHFrameHdrSegment;
+
   /// Location and size of dynamic relocations.
   std::optional<uint64_t> DynamicRelocationsAddress;
   uint64_t DynamicRelocationsSize{0};
   uint64_t DynamicRelativeRelocationsCount{0};
+
+  BinarySection *RISCVFarDataRelocationSection{nullptr};
+  uint32_t RISCVFarDataDynsymIndex{0};
 
   // Location and size of .relr.dyn relocations.
   std::optional<uint64_t> DynamicRelrAddress;

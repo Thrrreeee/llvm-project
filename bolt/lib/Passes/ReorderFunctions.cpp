@@ -840,6 +840,37 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
 
   reorder(BC, std::move(Clusters), BFs, UserFileEndIndex);
 
+  if (!BC.RISCVFarDataEarlyFunctions.empty()) {
+    BinaryFunctionListType OrderedFunctions;
+    for (BinaryFunction &BF : llvm::make_second_range(BFs))
+      if (BC.shouldEmit(BF))
+        OrderedFunctions.push_back(&BF);
+    llvm::stable_sort(OrderedFunctions, compareBinaryFunctionByIndex);
+    auto IsEarly = [&BC](const BinaryFunction *BF) {
+      return BC.RISCVFarDataEarlyFunctions.contains(BF);
+    };
+    const bool ChangesOrder = !std::is_partitioned(
+        OrderedFunctions.begin(), OrderedFunctions.end(), IsEarly);
+    const bool ChangesUserOrder =
+        ChangesOrder && llvm::any_of(OrderedFunctions, [&](BinaryFunction *BF) {
+          return UserOrderedFuncs.contains(BF) && !IsEarly(BF);
+        });
+    const auto EarlyEnd = std::stable_partition(
+        OrderedFunctions.begin(), OrderedFunctions.end(), IsEarly);
+    uint32_t Index = 0;
+    for (BinaryFunction *BF : OrderedFunctions) {
+      BF->clearIndex();
+      BF->setIndex(Index++);
+    }
+    BC.outs() << "BOLT-INFO: RISC-V far-data placement: "
+              << std::distance(OrderedFunctions.begin(), EarlyEnd)
+              << " functions placed before remaining emitted functions\n";
+    if (ChangesUserOrder)
+      BC.errs() << "BOLT-WARNING: RISC-V far-data placement changes the "
+                   "requested function order; relative order within each "
+                   "group is preserved\n";
+  }
+
   BC.HasFinalizedFunctionOrder = true;
 
   std::unique_ptr<std::ofstream> FuncsFile;

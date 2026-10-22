@@ -157,6 +157,19 @@ void InstrumentationRuntimeLibrary::emitBinary(BinaryContext &BC,
     emitFill(1);
   };
 
+  // The runtime remaps and clears pages beginning at __bolt_instr_locations.
+  // Keep relocated addresses on earlier pages so this does not erase them.
+  // A prefix also keeps these slots closer to the beginning of large code.
+  for (BinaryContext::RISCVFarDataSlot &Slot : BC.RISCVFarDataSlots) {
+    emitPadding(sizeof(uint64_t));
+    Slot.Offset = EmitOffset;
+    emitLabel(Slot.Label, /*IsGlobal=*/false);
+    Streamer.emitIntValue(0, sizeof(uint64_t));
+    emitDataSize(sizeof(uint64_t));
+  }
+  if (!BC.RISCVFarDataSlots.empty())
+    emitPadding(BC.RegularPageSize);
+
   // All of the following symbols will be exported as globals to be used by the
   // instrumentation runtime library to dump the instrumentation data to disk.
   // Label marking start of the memory region containing instrumentation

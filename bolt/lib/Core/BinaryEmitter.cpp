@@ -102,6 +102,19 @@ size_t padFunctionAfter(const BinaryFunction &Function) {
 namespace {
 using JumpTable = bolt::JumpTable;
 
+// Large RISC-V instrumentation allocations can be more than 2 GiB from the
+// original personality/typeinfo pointer slots. Preserve application/indirect
+// bits while widening the relative displacement that we emit for these slots.
+static unsigned getOutputEHEncoding(const BinaryContext &BC,
+                                    unsigned Encoding) {
+  if (BC.KeepOriginalEHFrame && BC.isRISCV() &&
+      (Encoding & 0x70) == dwarf::DW_EH_PE_pcrel &&
+      ((Encoding & 0x0f) == dwarf::DW_EH_PE_sdata4 ||
+       (Encoding & 0x0f) == dwarf::DW_EH_PE_udata4))
+    return (Encoding & ~0x0f) | dwarf::DW_EH_PE_sdata8;
+  return Encoding;
+}
+
 class BinaryEmitter {
 private:
   BinaryEmitter(const BinaryEmitter &) = delete;
@@ -366,8 +379,9 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   if (NeedsFDE) {
     Streamer.emitCFIStartProc(/*IsSimple=*/false);
     if (Function.getPersonalityFunction() != nullptr)
-      Streamer.emitCFIPersonality(Function.getPersonalityFunction(),
-                                  Function.getPersonalityEncoding());
+      Streamer.emitCFIPersonality(
+          Function.getPersonalityFunction(),
+          getOutputEHEncoding(BC, Function.getPersonalityEncoding()));
     MCSymbol *LSDASymbol = Function.getLSDASymbol(FF.getFragmentNum());
     if (LSDASymbol)
       Streamer.emitCFILsda(LSDASymbol, BC.LSDAEncoding);
@@ -945,9 +959,11 @@ void BinaryEmitter::emitLSDA(BinaryFunction &BF, const FunctionFragment &FF) {
 
   Streamer.switchSection(BC.MOFI->getLSDASection());
 
-  const unsigned TTypeEncoding = BF.getLSDATypeEncoding();
+  const unsigned TTypeEncoding =
+      getOutputEHEncoding(BC, BF.getLSDATypeEncoding());
   const unsigned TTypeEncodingSize = BC.getDWARFEncodingSize(TTypeEncoding);
-  const uint16_t TTypeAlignment = 4;
+  const uint16_t TTypeAlignment =
+      BC.KeepOriginalEHFrame ? std::max(4u, TTypeEncodingSize) : 4;
 
   // Type tables have to be aligned at 4 bytes.
   Streamer.emitValueToAlignment(Align(TTypeAlignment));

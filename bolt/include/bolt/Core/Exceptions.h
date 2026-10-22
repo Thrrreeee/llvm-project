@@ -61,9 +61,14 @@ public:
   ///
   /// \p EHFrameHeaderAddress specifies location of .eh_frame_hdr,
   /// and is required for relative addressing used in the section.
+  /// If provided, \p SData4BaseMin and \p SData4BaseMax receive the inclusive
+  /// range of header addresses for which all relative fields fit in sdata4.
+  /// A minimum greater than the maximum denotes an empty range.
   std::vector<char> generateEHFrameHeader(const DWARFDebugFrame &OldEHFrame,
                                           const DWARFDebugFrame &NewEHFrame,
-                                          uint64_t EHFrameHeaderAddress) const;
+                                          uint64_t EHFrameHeaderAddress,
+                                          uint64_t *SData4BaseMin = nullptr,
+                                          uint64_t *SData4BaseMax = nullptr) const;
 
   using FDEsMap = std::map<uint64_t, const dwarf::FDE *>;
 

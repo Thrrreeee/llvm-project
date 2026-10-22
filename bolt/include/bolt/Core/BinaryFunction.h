@@ -1219,6 +1219,9 @@ public:
   /// Get the streaming order index for this function.
   uint32_t getIndex() const { return Index; }
 
+  /// Clear the streaming order index before recomputing function order.
+  void clearIndex() { Index = -1U; }
+
   /// Set the streaming order index for this function.
   void setIndex(uint32_t Idx) {
     assert(!hasValidIndex());

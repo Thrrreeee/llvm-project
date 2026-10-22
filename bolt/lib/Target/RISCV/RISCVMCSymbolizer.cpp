@@ -12,11 +12,16 @@
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Core/MCPlusBuilder.h"
 #include "bolt/Core/Relocation.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCInst.h"
 
 #define DEBUG_TYPE "bolt-symbolizer"
+
+namespace opts {
+extern llvm::cl::opt<bool> RISCVInstrumentationFarData;
+}
 
 namespace llvm {
 namespace bolt {
@@ -266,6 +271,16 @@ bool RISCVMCSymbolizer::tryAddingSymbolicOperand(
   // MC annotations must follow every real operand. Attach the instruction
   // label only after the symbolized immediate has been appended.
   if (CreateNewSymbols) {
+    // Keep the input location of each high/low data relocation. The far-data
+    // pass runs before inlining and recovers the original encoded immediate
+    // from these bytes; a symbolized low operand no longer contains that value.
+    // Use the existing inline offset annotation instead of allocating separate
+    // metadata objects for millions of references in large binaries.
+    if (opts::RISCVInstrumentationFarData && opts::Instrument &&
+        BC.SupportsRISCVFarDataSlots &&
+        (Rel->Type == ELF::R_RISCV_PCREL_HI20 || RH.isGOT(Rel->Type) ||
+         RH.isInstructionReference(Rel->Type)))
+      BC.MIB->setOffset(Inst, InstOffset);
     auto It = InstructionReferences.find(InstOffset);
     if (It != InstructionReferences.end())
       BC.MIB->setInstLabel(Inst, getOrCreateInstructionLabel(It->second));

@@ -14,6 +14,7 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Endian.h"
@@ -202,21 +203,29 @@ void BinarySection::flushPendingRelocations(raw_fd_ostream &OS,
       continue;
     }
 
+    if (RH.isInstructionRelocation(Reloc.Type)) {
+      const size_t Size = Reloc.getSize(RH);
+      StringRef Input = getContents();
+      if (Reloc.Offset > Input.size() || Size > Input.size() - Reloc.Offset)
+        report_fatal_error("instruction relocation outside original section");
+
+      // Patch a copy: the input section contents must remain unchanged.
+      SmallString<8> Code(Input.substr(Reloc.Offset, Size));
+      RH.applyInstructionRelocation(Code, Reloc.Type, Value,
+                                    SectionAddress + Reloc.Offset);
+      safePWrite(OS, Code.data(), Code.size(),
+                 SectionFileOffset + Reloc.Offset);
+      continue;
+    }
+
     uint32_t OriginalInst = 0;
-    // Preserve the non-immediate bits when rewriting instruction relocations.
-    if ((BC.isAArch64() && (Reloc.Type == ELF::R_AARCH64_CONDBR19 ||
-                            Reloc.Type == ELF::R_AARCH64_TSTBR14)) ||
-        (BC.isRISCV() && (Reloc.Type == ELF::R_RISCV_BRANCH ||
-                         Reloc.Type == ELF::R_RISCV_JAL ||
-                         Reloc.Type == ELF::R_RISCV_RVC_BRANCH ||
-                         Reloc.Type == ELF::R_RISCV_RVC_JUMP))) {
+    // AArch64 conditional branches also retain their non-immediate fields.
+    if (BC.isAArch64() && (Reloc.Type == ELF::R_AARCH64_CONDBR19 ||
+                           Reloc.Type == ELF::R_AARCH64_TSTBR14)) {
       StringRef Contents = getContents();
-      const size_t Size = RH.getSizeForType(Reloc.Type);
-      assert(Contents.size() >= Reloc.Offset + Size &&
+      assert(Contents.size() >= Reloc.Offset + 4 &&
              "Complete instruction must lie in contents.");
-      const char *Data = Contents.data() + Reloc.Offset;
-      OriginalInst = Size == 2 ? support::endian::read16le(Data)
-                               : support::endian::read32le(Data);
+      OriginalInst = support::endian::read32le(Contents.data() + Reloc.Offset);
     }
     Value = RH.encodeValue(Reloc.Type, Value, SectionAddress + Reloc.Offset,
                            OriginalInst);

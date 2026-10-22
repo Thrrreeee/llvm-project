@@ -295,6 +295,20 @@ class BinaryContext {
   /// Mutex used for parallel processing of DWP type units.
   std::mutex DWPUnitsMutex;
 
+  /// References in fixed code that must not be entered partway through the
+  /// instruction sequence being rewritten. Keep their source identity until
+  /// entry-point discovery is complete, rather than submitting them directly
+  /// to the section's output relocation queue.
+  struct FixedReference {
+    BinaryFunction *Source;
+    Relocation Rel;
+    uint64_t Size;
+    bool HasInteriorEntry;
+  };
+  std::vector<FixedReference> FixedReferences;
+  bool FixedReferenceEntriesComplete{false};
+  bool ProcessingFixedReferences{false};
+
 public:
   static Expected<std::unique_ptr<BinaryContext>> createBinaryContext(
       Triple TheTriple, std::shared_ptr<orc::SymbolStringPool> SSP,
@@ -1273,6 +1287,16 @@ public:
   /// Resolve inter-procedural branch dependencies discovered during
   /// disassembly.
   void processInterproceduralReferences();
+
+  /// Collect a fixed-code relocation with a function-relative offset and the
+  /// complete byte range that must be independently rewritable.
+  void addFixedReference(BinaryFunction &Source, Relocation Rel, uint64_t Size);
+
+  /// Validate candidates and preserve unsafe targets before submitting output
+  /// relocations. Set EntriesComplete after original entry-point discovery and
+  /// before optimization. Later scans also use this method to drain candidates
+  /// recursively produced by ignoring functions.
+  void processFixedReferences(bool EntriesComplete = false);
 
   /// Skip functions with all parent and child fragments transitively.
   void skipMarkedFragments();

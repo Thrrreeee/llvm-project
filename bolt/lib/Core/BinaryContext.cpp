@@ -41,6 +41,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBufferRef.h"
 #include "llvm/Support/Regex.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include <algorithm>
 #include <functional>
@@ -1675,6 +1676,68 @@ void BinaryContext::processInterproceduralReferences() {
       Function->setIgnored();
 
   InterproceduralReferences.clear();
+}
+
+void BinaryContext::addFixedReference(BinaryFunction &Source, Relocation Rel,
+                                      uint64_t Size) {
+  assert(Size && Rel.Offset <= Source.getSize() &&
+         Size <= Source.getSize() - Rel.Offset &&
+         "fixed reference outside source function");
+  // Scanning clears these offsets. Preserve any interior entry they describe;
+  // labels discovered by other functions remain available for final validation.
+  auto Entry = Source.ExternallyReferencedOffsets.upper_bound(Rel.Offset);
+  const bool HasInteriorEntry =
+      Entry != Source.ExternallyReferencedOffsets.end() &&
+      *Entry < Rel.Offset + Size;
+  FixedReferences.push_back({&Source, Rel, Size, HasInteriorEntry});
+}
+
+void BinaryContext::processFixedReferences(bool EntriesComplete) {
+  if (EntriesComplete)
+    FixedReferenceEntriesComplete = true;
+  if (FixedReferences.empty() || !FixedReferenceEntriesComplete ||
+      ProcessingFixedReferences)
+    return;
+
+  // Like external-reference scanning, this phase is serial. Scans triggered by
+  // this invocation only append candidates; validate them before submitting any
+  // candidate to the output relocation queue.
+  const SaveAndRestore Processing(ProcessingFixedReferences, true);
+  while (true) {
+    SmallPtrSet<BinaryFunction *, 4> TargetsToPreserve;
+    for (FixedReference &Reference : FixedReferences) {
+      const BinaryFunction &Source = *Reference.Source;
+      const uint64_t End = Reference.Rel.Offset + Reference.Size;
+      auto Label = Source.Labels.upper_bound(Reference.Rel.Offset);
+      auto Entry =
+          Source.ExternallyReferencedOffsets.upper_bound(Reference.Rel.Offset);
+      Reference.HasInteriorEntry |=
+          (Label != Source.Labels.end() && Label->first < End) ||
+          (Entry != Source.ExternallyReferencedOffsets.end() && *Entry < End);
+      if (!Reference.HasInteriorEntry)
+        continue;
+      if (BinaryFunction *Target = getFunctionForSymbol(Reference.Rel.Symbol))
+        if (!Target->isIgnored())
+          TargetsToPreserve.insert(Target);
+    }
+    if (TargetsToPreserve.empty())
+      break;
+    // Ignoring targets can expose more entries and append new candidates.
+    // Repeat validation before committing any relocation.
+    for (BinaryFunction *Target : TargetsToPreserve)
+      if (!Target->isIgnored())
+        Target->setIgnored();
+  }
+
+  for (FixedReference &Reference : FixedReferences) {
+    if (Reference.HasInteriorEntry)
+      continue;
+    BinaryFunction &Source = *Reference.Source;
+    Reference.Rel.Offset +=
+        Source.getAddress() - Source.getOriginSection()->getAddress();
+    Source.getOriginSection()->addPendingRelocation(Reference.Rel);
+  }
+  FixedReferences.clear();
 }
 
 void BinaryContext::postProcessSymbolTable() {

@@ -14,6 +14,7 @@
 #ifndef BOLT_CORE_RELOCATION_H
 #define BOLT_CORE_RELOCATION_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCStreamer.h"
 #include <memory>
@@ -53,6 +54,18 @@ public:
   /// OriginalInst preserves non-immediate bits in instruction relocations.
   virtual uint64_t encodeValue(uint32_t Type, uint64_t Value, uint64_t PC,
                                uint32_t OriginalInst = 0) const = 0;
+
+  /// Whether updating this relocation needs the original instruction bytes.
+  virtual bool isInstructionRelocation(uint32_t Type) const { return false; }
+
+  /// Update an instruction relocation in place, preserving non-immediate bits.
+  /// Data must contain exactly getSizeForType(Type) bytes. Diagnose a target
+  /// outside the encoding range before changing Data.
+  virtual void applyInstructionRelocation(MutableArrayRef<char> Data,
+                                          uint32_t Type, uint64_t Value,
+                                          uint64_t PC) const {
+    llvm_unreachable("unsupported instruction relocation");
+  }
 
   /// Return true if there are enough bits to encode the relocation value.
   virtual bool canEncodeValue(uint32_t Type, uint64_t Value,

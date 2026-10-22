@@ -1603,7 +1603,7 @@ void BinaryFunction::analyzeInstructionForFuncReference(const MCInst &Inst) {
 bool BinaryFunction::scanExternalRefs() {
   bool Success = true;
   bool DisassemblyFailed = false;
-  SmallPtrSet<BinaryFunction *, 4> InvalidTargets;
+  SmallPtrSet<BinaryFunction *, 4> TargetsToPreserve;
 
   // Ignore pseudo functions.
   if (isPseudo())
@@ -1618,6 +1618,7 @@ bool BinaryFunction::scanExternalRefs() {
 
   // List of external references for this function.
   std::vector<Relocation> FunctionRelocations;
+  SmallVector<std::pair<Relocation, uint64_t>, 4> FixedReferences;
 
   static BinaryContext::IndependentCodeEmitter Emitter =
       BC.createIndependentMCCodeEmitter();
@@ -1662,6 +1663,19 @@ bool BinaryFunction::scanExternalRefs() {
       Success = false;
       DisassemblyFailed = true;
       break;
+    }
+
+    if (std::optional<MCPlusBuilder::FixedReferenceResult> Reference =
+            BC.MIB->analyzeFixedReference(*this, Instruction, Offset, Size,
+                                          FunctionData, *Emitter.MCE)) {
+      if (Reference->EntryFunction)
+        Reference->EntryFunction->getOrCreateLocalLabel(
+            Reference->EntryAddress);
+      if (Reference->TargetToPreserve)
+        TargetsToPreserve.insert(Reference->TargetToPreserve);
+      if (Reference->Rel)
+        FixedReferences.emplace_back(*Reference->Rel, Reference->Size);
+      continue;
     }
 
     // Return true if we can skip handling the Target function reference.
@@ -1713,7 +1727,7 @@ bool BinaryFunction::scanExternalRefs() {
       BranchTargetSymbol =
           BC.handleExternalBranchTarget(TargetAddress, *this, *TargetFunction);
       if (!BranchTargetSymbol) {
-        InvalidTargets.insert(TargetFunction);
+        TargetsToPreserve.insert(TargetFunction);
         continue;
       }
     }
@@ -1899,6 +1913,15 @@ bool BinaryFunction::scanExternalRefs() {
     for (Relocation &Rel : FunctionRelocations)
       getOriginSection()->addPendingRelocation(Rel);
 
+  // Target-specific candidates need complete entry-point information before
+  // they can become output relocations. Failed scans cannot repair their calls.
+  for (const auto &[Rel, Size] : FixedReferences) {
+    if (!DisassemblyFailed)
+      BC.addFixedReference(*this, Rel, Size);
+    else if (BinaryFunction *Target = BC.getFunctionForSymbol(Rel.Symbol))
+      TargetsToPreserve.insert(Target);
+  }
+
   // Add patches grouping them together.
   if (!InstructionPatches.empty()) {
     uint64_t PatchGroupAddress;
@@ -1927,10 +1950,11 @@ bool BinaryFunction::scanExternalRefs() {
 
   // Apply target state only after the complete source has been scanned. The
   // source is either already ignored or is marked ignored by the caller.
-  for (BinaryFunction *Target : InvalidTargets)
+  for (BinaryFunction *Target : TargetsToPreserve)
     if (!Target->isIgnored())
       Target->setIgnored();
 
+  BC.processFixedReferences();
   return Success;
 }
 

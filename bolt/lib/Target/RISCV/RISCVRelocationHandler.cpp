@@ -12,6 +12,7 @@
 
 #include "bolt/Core/Relocation.h"
 #include "llvm/Object/ELF.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -40,6 +41,9 @@ public:
 
   uint64_t encodeValue(uint32_t Type, uint64_t Value, uint64_t PC,
                        uint32_t OriginalInst) const override;
+  bool isInstructionRelocation(uint32_t Type) const override;
+  void applyInstructionRelocation(MutableArrayRef<char> Data, uint32_t Type,
+                                  uint64_t Value, uint64_t PC) const override;
   bool canEncodeValue(uint32_t Type, uint64_t Value,
                       uint64_t PC) const override;
   uint64_t extractValue(uint32_t Type, uint64_t Contents,
@@ -194,88 +198,128 @@ bool RISCVRelocationHandler::skipRelocationType(uint32_t Type) const {
   }
 }
 
+bool RISCVRelocationHandler::isInstructionRelocation(uint32_t Type) const {
+  switch (Type) {
+  default:
+    return false;
+  case ELF::R_RISCV_BRANCH:
+  case ELF::R_RISCV_JAL:
+  case ELF::R_RISCV_RVC_BRANCH:
+  case ELF::R_RISCV_RVC_JUMP:
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    return true;
+  }
+}
+
 bool RISCVRelocationHandler::canEncodeValue(uint32_t Type, uint64_t Value,
                                             uint64_t PC) const {
+  // PC-relative arithmetic wraps at XLEN, including branches across address 0.
+  const int64_t Offset = !Is64Bit ? SignExtend64<32>(Value - PC) : Value - PC;
   switch (Type) {
   default:
     llvm_unreachable("unsupported relocation");
   case ELF::R_RISCV_32:
   case ELF::R_RISCV_64:
     return true;
+  case ELF::R_RISCV_BRANCH:
+    return !(Offset & 1) && isInt<13>(Offset);
+  case ELF::R_RISCV_JAL:
+    return !(Offset & 1) && isInt<21>(Offset);
+  case ELF::R_RISCV_RVC_BRANCH:
+    return !(Offset & 1) && isInt<9>(Offset);
+  case ELF::R_RISCV_RVC_JUMP:
+    return !(Offset & 1) && isInt<12>(Offset);
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    // AUIPC/JALR can reach any aligned address in the RV32 address space.
+    if (!Is64Bit)
+      return !(Offset & 1);
+    // Account for the carry from the signed low immediate. In RV64 the
+    // rounded high part must still fit the sign-extended AUIPC immediate.
+    return !(Offset & 1) && Offset >= INT64_C(-2147485696) &&
+           Offset <= INT64_C(2147481599);
+  }
+}
+
+void RISCVRelocationHandler::applyInstructionRelocation(
+    MutableArrayRef<char> Data, uint32_t Type, uint64_t Value,
+    uint64_t PC) const {
+  assert(isInstructionRelocation(Type) &&
+         "expected a RISC-V control-flow relocation");
+  assert(Data.size() == getSizeForType(Type) &&
+         "unexpected RISC-V instruction buffer size");
+  if (!canEncodeValue(Type, Value, PC))
+    report_fatal_error("fixed RISC-V reference exceeds its encoding range");
+
+  auto Patch16 = [](char *Location, uint16_t Immediate, uint16_t Mask) {
+    const uint16_t Inst = support::endian::read16le(Location);
+    support::endian::write16le(Location, (Inst & ~Mask) | Immediate);
+  };
+  auto Patch32 = [](char *Location, uint32_t Immediate, uint32_t Mask) {
+    const uint32_t Inst = support::endian::read32le(Location);
+    support::endian::write32le(Location, (Inst & ~Mask) | Immediate);
+  };
+
+  const uint64_t Offset = Value - PC;
+  switch (Type) {
+  default:
+    llvm_unreachable("unsupported RISC-V control-flow relocation");
+  case ELF::R_RISCV_BRANCH:
+    Patch32(Data.data(),
+            ((Offset & 0x1000) << 19) | ((Offset & 0x7e0) << 20) |
+                ((Offset & 0x1e) << 7) | ((Offset & 0x800) >> 4),
+            0xfe000f80);
+    return;
+  case ELF::R_RISCV_JAL:
+    Patch32(Data.data(),
+            ((Offset & 0x100000) << 11) | ((Offset & 0x7fe) << 20) |
+                ((Offset & 0x800) << 9) | (Offset & 0xff000),
+            0xfffff000);
+    return;
+  case ELF::R_RISCV_RVC_BRANCH:
+    Patch16(Data.data(),
+            ((Offset & 0x100) << 4) | ((Offset & 0x18) << 7) |
+                ((Offset & 0xc0) >> 1) | ((Offset & 0x6) << 2) |
+                ((Offset & 0x20) >> 3),
+            0x1c7c);
+    return;
+  case ELF::R_RISCV_RVC_JUMP:
+    Patch16(Data.data(),
+            ((Offset & 0x800) << 1) | ((Offset & 0x10) << 7) |
+                ((Offset & 0x300) << 1) | ((Offset & 0x400) >> 2) |
+                ((Offset & 0x40) << 1) | ((Offset & 0x80) >> 1) |
+                ((Offset & 0xe) << 2) | ((Offset & 0x20) >> 3),
+            0x1ffc);
+    return;
+  case ELF::R_RISCV_CALL:
+  case ELF::R_RISCV_CALL_PLT:
+    // Update AUIPC and JALR separately, preserving both instructions' register
+    // operands. Round the high part to account for the signed low immediate.
+    Patch32(Data.data(), (Offset + 0x800) & 0xfffff000, 0xfffff000);
+    Patch32(Data.data() + 4, (Offset & 0xfff) << 20, 0xfff00000);
+    return;
   }
 }
 
 uint64_t RISCVRelocationHandler::encodeValue(uint32_t Type, uint64_t Value,
                                              uint64_t PC,
                                              uint32_t OriginalInst) const {
-  auto encodePCRel = [&](uint32_t Type, uint64_t Value) -> uint64_t {
-    const int64_t PCRelValue =
-        static_cast<int64_t>(Value) - static_cast<int64_t>(PC);
-    assert((PCRelValue & 0x1) == 0 && "RISC-V branch target is misaligned");
-    const uint64_t EncValue = static_cast<uint64_t>(PCRelValue);
-    switch (Type) {
-    default:
-      llvm_unreachable("unsupported relocation");
-    case ELF::R_RISCV_BRANCH: {
-      assert(isInt<13>(PCRelValue) && "RISC-V branch target out of range");
-      const uint64_t Sbit = (EncValue >> 12) & 0x1;
-      const uint64_t Hi1 = (EncValue >> 11) & 0x1;
-      const uint64_t Mid6 = (EncValue >> 5) & 0x3f;
-      const uint64_t Lo4 = (EncValue >> 1) & 0xf;
-      return (OriginalInst & 0x01fff07f) | (Sbit << 31) | (Mid6 << 25) |
-             (Lo4 << 8) | (Hi1 << 7);
-    }
-    case ELF::R_RISCV_JAL: {
-      assert(isInt<21>(PCRelValue) && "RISC-V jump target out of range");
-      const uint64_t Sbit = (EncValue >> 20) & 0x1;
-      const uint64_t Hi8 = (EncValue >> 12) & 0xff;
-      const uint64_t Mid1 = (EncValue >> 11) & 0x1;
-      const uint64_t Lo10 = (EncValue >> 1) & 0x3ff;
-      return (OriginalInst & 0xfff) | (Sbit << 31) | (Lo10 << 21) | (Mid1 << 20) |
-             (Hi8 << 12);
-    }
-    case ELF::R_RISCV_RVC_BRANCH: {
-      assert(isInt<9>(PCRelValue) &&
-             "RISC-V compressed branch target out of range");
-      const uint64_t Bit8 = (EncValue >> 8) & 0x1;
-      const uint64_t Bit7_6 = (EncValue >> 6) & 0x3;
-      const uint64_t Bit5 = (EncValue >> 5) & 0x1;
-      const uint64_t Bit4_3 = (EncValue >> 3) & 0x3;
-      const uint64_t Bit2_1 = (EncValue >> 1) & 0x3;
-      return (OriginalInst & 0xe383) | (Bit8 << 12) | (Bit4_3 << 10) |
-             (Bit7_6 << 5) | (Bit2_1 << 3) | (Bit5 << 2);
-    }
-    case ELF::R_RISCV_RVC_JUMP: {
-      assert(isInt<12>(PCRelValue) &&
-             "RISC-V compressed jump target out of range");
-      const uint64_t Bit11 = (EncValue >> 11) & 0x1;
-      const uint64_t Bit4 = (EncValue >> 4) & 0x1;
-      const uint64_t Bit9_8 = (EncValue >> 8) & 0x3;
-      const uint64_t Bit10 = (EncValue >> 10) & 0x1;
-      const uint64_t Bit6 = (EncValue >> 6) & 0x1;
-      const uint64_t Bit7 = (EncValue >> 7) & 0x1;
-      const uint64_t Bit3_1 = (EncValue >> 1) & 0x7;
-      const uint64_t Bit5 = (EncValue >> 5) & 0x1;
-      return (OriginalInst & 0xe003) | (Bit11 << 12) | (Bit4 << 11) |
-             (Bit9_8 << 9) | (Bit10 << 8) | (Bit6 << 7) | (Bit7 << 6) |
-             (Bit3_1 << 3) | (Bit5 << 2);
-    }
-    }
-  };
-
+  if (isInstructionRelocation(Type) && getSizeForType(Type) <= 4) {
+    char Data[4];
+    support::endian::write32le(Data, OriginalInst);
+    applyInstructionRelocation(
+        MutableArrayRef<char>(Data, getSizeForType(Type)), Type, Value, PC);
+    return getSizeForType(Type) == 2 ? support::endian::read16le(Data)
+                                     : support::endian::read32le(Data);
+  }
   switch (Type) {
   default:
     llvm_unreachable("unsupported relocation");
   case ELF::R_RISCV_32:
   case ELF::R_RISCV_64:
-    break;
-  case ELF::R_RISCV_BRANCH:
-  case ELF::R_RISCV_JAL:
-  case ELF::R_RISCV_RVC_BRANCH:
-  case ELF::R_RISCV_RVC_JUMP:
-    return encodePCRel(Type, Value);
+    return Value;
   }
-  return Value;
 }
 
 static uint64_t extractUImmRISCV(uint32_t Contents) {

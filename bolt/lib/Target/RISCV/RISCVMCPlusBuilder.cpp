@@ -14,15 +14,21 @@
 #include "MCTargetDesc/RISCVMCAsmInfo.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "RISCVMCSymbolizer.h"
+#include "bolt/Core/BinaryContext.h"
+#include "bolt/Core/BinaryFunction.h"
 #include "bolt/Core/MCPlusBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCValue.h"
 #include "llvm/Support/ErrorHandling.h"
 
 #define DEBUG_TYPE "mcplus"
@@ -1205,69 +1211,188 @@ public:
   std::optional<Relocation>
   createRelocation(const MCFixup &Fixup,
                    const MCAsmBackend &MAB) const override {
-    (void)MAB;
-    const uint64_t RelOffset = Fixup.getOffset();
+    uint32_t Type;
+    switch (Fixup.getKind()) {
+    default:
+      return std::nullopt;
+    // MC may encode ELF relocation types directly as fixup kinds.
+    case ELF::R_RISCV_BRANCH:
+    case ELF::R_RISCV_JAL:
+    case ELF::R_RISCV_RVC_BRANCH:
+    case ELF::R_RISCV_RVC_JUMP:
+    case ELF::R_RISCV_CALL:
+    case ELF::R_RISCV_CALL_PLT:
+    case ELF::R_RISCV_32:
+    case ELF::R_RISCV_64:
+      Type = Fixup.getKind();
+      break;
+    case FK_Data_4:
+      if (Fixup.isPCRel())
+        return std::nullopt;
+      Type = ELF::R_RISCV_32;
+      break;
+    case FK_Data_8:
+      if (Fixup.isPCRel())
+        return std::nullopt;
+      Type = ELF::R_RISCV_64;
+      break;
+    case RISCV::fixup_riscv_branch:
+      Type = ELF::R_RISCV_BRANCH;
+      break;
+    case RISCV::fixup_riscv_jal:
+      Type = ELF::R_RISCV_JAL;
+      break;
+    case RISCV::fixup_riscv_rvc_branch:
+      Type = ELF::R_RISCV_RVC_BRANCH;
+      break;
+    case RISCV::fixup_riscv_rvc_jump:
+      Type = ELF::R_RISCV_RVC_JUMP;
+      break;
+    case RISCV::fixup_riscv_call:
+    case RISCV::fixup_riscv_call_plt:
+      Type = ELF::R_RISCV_CALL_PLT;
+      break;
+    }
+    // The fixup kind already carries the relocation specifier. Evaluating a
+    // target expression without an assembler can fail, so evaluate its symbol
+    // and addend independently of the %call/%pcrel wrapper.
+    const MCExpr *Expr = Fixup.getValue();
+    while (const auto *Specifier = dyn_cast<MCSpecifierExpr>(Expr))
+      Expr = Specifier->getSubExpr();
+    MCValue Value;
+    if (!Expr->evaluateAsRelocatable(Value, nullptr) || Value.getSubSym())
+      return std::nullopt;
+    return Relocation{Fixup.getOffset(),
+                      const_cast<MCSymbol *>(Value.getAddSym()), Type,
+                      static_cast<uint64_t>(Value.getConstant()), 0};
+  }
 
-    uint32_t RelType;
-    if (mc::isRelocation(Fixup.getKind())) {
-      RelType = Fixup.getKind();
-    } else if (Fixup.isPCRel()) {
-      switch (Fixup.getKind()) {
-      default:
-        return std::nullopt;
-      case FK_Data_4:
-        RelType = ELF::R_RISCV_32_PCREL;
-        break;
-      case RISCV::fixup_riscv_pcrel_hi20:
-        RelType = ELF::R_RISCV_PCREL_HI20;
-        break;
-      case RISCV::fixup_riscv_pcrel_lo12_i:
-        RelType = ELF::R_RISCV_PCREL_LO12_I;
-        break;
-      case RISCV::fixup_riscv_pcrel_lo12_s:
-        RelType = ELF::R_RISCV_PCREL_LO12_S;
-        break;
-      case RISCV::fixup_riscv_jal:
-        RelType = ELF::R_RISCV_JAL;
-        break;
-      case RISCV::fixup_riscv_branch:
-        RelType = ELF::R_RISCV_BRANCH;
-        break;
-      case RISCV::fixup_riscv_rvc_jump:
-        RelType = ELF::R_RISCV_RVC_JUMP;
-        break;
-      case RISCV::fixup_riscv_rvc_branch:
-        RelType = ELF::R_RISCV_RVC_BRANCH;
-        break;
-      case RISCV::fixup_riscv_call:
-      case RISCV::fixup_riscv_call_plt:
-        RelType = ELF::R_RISCV_CALL_PLT;
-        break;
+  std::optional<FixedReferenceResult>
+  analyzeFixedReference(BinaryFunction &Function, const MCInst &Inst,
+                        uint64_t Offset, uint64_t Size,
+                        ArrayRef<uint8_t> FunctionData,
+                        MCCodeEmitter &Emitter) const override {
+    BinaryContext &BC = Function.getBinaryContext();
+    FixedReferenceResult Result;
+    auto IgnoreFunction = [&](const BinaryFunction &Target) {
+      return &Target == &Function || !BC.shouldEmit(Target);
+    };
+
+    if (isCall(Inst) || isBranch(Inst)) {
+      uint64_t TargetAddress;
+      if (Inst.getOpcode() == RISCV::JALR) {
+        // Only x0 provides a statically known base here. Match the entry
+        // discovered by the symbolizer, including JALR's clearing of bit zero.
+        if (Inst.getOperand(1).getReg() != RISCV::X0)
+          return Result;
+        TargetAddress =
+            static_cast<uint64_t>(Inst.getOperand(2).getImm()) & ~1ULL;
+        if (!isRV64())
+          TargetAddress = static_cast<uint32_t>(TargetAddress);
+      } else if (!evaluateBranch(Inst, Function.getAddress() + Offset, Size,
+                                 TargetAddress)) {
+        return Result;
       }
-    } else {
-      switch (Fixup.getKind()) {
-      default:
-        return std::nullopt;
-      case FK_Data_4:
-        RelType = ELF::R_RISCV_32;
-        break;
-      case FK_Data_8:
-        RelType = ELF::R_RISCV_64;
-        break;
-      case RISCV::fixup_riscv_hi20:
-        RelType = ELF::R_RISCV_HI20;
-        break;
-      case RISCV::fixup_riscv_lo12_i:
-        RelType = ELF::R_RISCV_LO12_I;
-        break;
-      case RISCV::fixup_riscv_lo12_s:
-        RelType = ELF::R_RISCV_LO12_S;
+      BinaryFunction *Target =
+          BC.getBinaryFunctionContainingAddress(TargetAddress);
+      if (!Target)
+        return Result;
+
+      // Even an edge to fixed code can enter the middle of another reference's
+      // instruction sequence. Let the caller record it without creating an
+      // unnecessary external entry symbol.
+      if (TargetAddress != Target->getAddress() && IgnoreFunction(*Target)) {
+        Result.EntryFunction = Target;
+        Result.EntryAddress = TargetAddress;
+      }
+      if (IgnoreFunction(*Target))
+        return Result;
+
+      const MCSymbol *Symbol =
+          BC.handleExternalBranchTarget(TargetAddress, Function, *Target);
+      // A short transfer cannot grow in place. An entry patch uses a scratch
+      // register that may be live across a hand-written assembly helper.
+      if (!Symbol || BC.HasRelocations)
+        Result.TargetToPreserve = Target;
+      return Result;
+    }
+
+    if (!BC.HasRelocations)
+      return Result;
+
+    Function.analyzeInstructionForFuncReference(Inst);
+    BinaryFunction *Target = nullptr;
+    for (const MCOperand &Op : MCPlus::primeOperands(Inst)) {
+      if (!Op.isExpr())
+        continue;
+      const MCSymbol *Symbol = getTargetSymbol(Op.getExpr());
+      if (!Symbol)
+        continue;
+      BinaryFunction *ReferencedFunction = BC.getFunctionForSymbol(Symbol);
+      const bool Forced = BC.forceSymbolRelocations(Symbol->getName());
+      // These linker-defined symbols move independently of function layout.
+      // Keeping a coincident function at its input address cannot preserve
+      // them.
+      if (Forced) {
+        BC.errs()
+            << "BOLT-ERROR: cannot update RISC-V instruction reference to "
+            << Symbol->getName() << " at address 0x"
+            << Twine::utohexstr(Function.getAddress() + Offset)
+            << " in ignored function " << Function << '\n';
+        exit(1);
+      }
+      if (!ReferencedFunction)
+        continue;
+      if (!IgnoreFunction(*ReferencedFunction)) {
+        Target = ReferencedFunction;
         break;
       }
     }
+    if (!Target)
+      return Result;
 
-    auto [RelSymbol, RelAddend] = extractFixupExpr(Fixup);
-    return Relocation({RelOffset, RelSymbol, RelType, RelAddend, 0});
+    auto PreserveTarget = [&]() {
+      Result.TargetToPreserve = Target;
+      Result.Rel.reset();
+      Result.Size = 0;
+      return Result;
+    };
+
+    // Only a complete AUIPC/JALR call can be rewritten independently of HI/LO
+    // data flow. Entry conflicts are checked when the caller finalizes the
+    // candidate after all incoming references have been discovered.
+    MCInst Next;
+    uint64_t NextSize = 0;
+    if (Size != 4 || Offset + 8 > Function.getSize() ||
+        Function.getSizeOfDataInCodeAt(Offset + 4) ||
+        Function.getRelocationInRange(Offset + 4, Offset + 8) ||
+        !BC.DisAsm->getInstruction(
+            Next, NextSize, FunctionData.slice(Offset + 4),
+            Function.getAddress() + Offset + 4, nulls()) ||
+        NextSize != 4 || !isRISCVCall(Inst, Next) ||
+        Inst.getOperand(0).getReg() != Next.getOperand(1).getReg())
+      return PreserveTarget();
+
+    SmallString<8> Code;
+    SmallVector<MCFixup, 4> Fixups;
+    Emitter.encodeInstruction(Inst, Code, Fixups, *BC.STI);
+    for (const MCFixup &Fixup : Fixups) {
+      // Relaxation markers do not describe a value to update in the fixed pair.
+      if (Fixup.getKind() == ELF::R_RISCV_RELAX)
+        continue;
+      std::optional<Relocation> Rel = createRelocation(Fixup, *BC.MAB);
+      // Interior targets must use secondary entry symbols: a residual addend
+      // cannot follow reordered blocks. A pair has only one value to update.
+      if (!Rel || Rel->Addend || Rel->getSize(BC.getRelocationHandler()) != 8 ||
+          Result.Rel)
+        return PreserveTarget();
+      Rel->Offset += Offset;
+      Result.Rel = *Rel;
+      Result.Size = 8;
+    }
+    if (!Result.Rel)
+      return PreserveTarget();
+    return Result;
   }
 
   InstructionListType createInstrIncMemory(const MCSymbol *Target,

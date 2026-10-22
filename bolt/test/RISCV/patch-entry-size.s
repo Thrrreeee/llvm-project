@@ -1,4 +1,5 @@
-## Code-size estimation must emit the AUIPC labels referenced by PCREL_LO12 fixups.
+## Estimate the emitted PseudoTAIL entry patch as an eight-byte AUIPC/JALR pair.
+## The instruction after the patch must remain at its original address.
 
 # RUN: llvm-mc -triple=riscv64 -filetype=obj %s -o %t.o
 # RUN: ld.lld --emit-relocs %t.o -o %t.exe
@@ -7,9 +8,10 @@
 
 # CHECK: BOLT-INFO: enabling relocation mode
 # CHECK-NOT: could not find corresponding %pcrel_hi
-# PATCH: auipc t0,
-# PATCH-NEXT: addi t0, t0,
-# PATCH-NEXT: jr t0
+# PATCH-LABEL: <_start.org.0>:
+# PATCH-NEXT: [[#%x,ADDR:]]: {{.*}} auipc t1,
+# PATCH-NEXT: [[#ADDR+4]]: {{.*}} jr {{.*}}(t1) <_start>
+# PATCH-NEXT: [[#ADDR+8]]: {{.*}} ecall
 
   .text
   .globl _start

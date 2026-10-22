@@ -43,6 +43,7 @@
 
 namespace llvm {
 class MCContext;
+class MCCodeEmitter;
 class MCFixup;
 class MCRegisterInfo;
 class MCSymbol;
@@ -2168,6 +2169,32 @@ public:
   createRelocation(const MCFixup &Fixup, const MCAsmBackend &MAB) const {
     llvm_unreachable("not implemented");
     return Relocation();
+  }
+
+  /// Target-specific analysis of a reference in code left at its input address.
+  /// A default-constructed result means no action. Otherwise, preserve
+  /// TargetToPreserve or validate Rel over its complete Size before applying
+  /// it. Rel.Offset is relative to the source function. EntryFunction and
+  /// EntryAddress record an incoming edge even if no relocation is needed.
+  struct FixedReferenceResult {
+    BinaryFunction *TargetToPreserve{nullptr};
+    std::optional<Relocation> Rel;
+    uint64_t Size{0};
+    BinaryFunction *EntryFunction{nullptr};
+    uint64_t EntryAddress{0};
+  };
+
+  /// Return nullopt to use the existing generic external-reference scanner.
+  /// Implementations must not ignore functions or submit pending relocations
+  /// while the shared disassembler is still scanning the source.
+  /// Cross-function entries must also be discovered during normal disassembly,
+  /// before optimization can finalize candidates from other fixed functions.
+  virtual std::optional<FixedReferenceResult>
+  analyzeFixedReference(BinaryFunction &Function, const MCInst &Inst,
+                        uint64_t Offset, uint64_t Size,
+                        ArrayRef<uint8_t> FunctionData,
+                        MCCodeEmitter &Emitter) const {
+    return std::nullopt;
   }
 
   /// Returns true if instruction is a call frame pseudo instruction.

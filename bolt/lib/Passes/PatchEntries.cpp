@@ -70,6 +70,7 @@ Error PatchEntries::runOnFunctions(BinaryContext &BC) {
     FillerSize = BC.computeCodeSize(Seq.begin(), Seq.end());
   }
 
+  std::vector<std::pair<BinaryFunction *, std::vector<Patch>>> EntryPatches;
   for (auto &BFI : BC.getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
 
@@ -133,7 +134,17 @@ Error PatchEntries::runOnFunctions(BinaryContext &BC) {
       continue;
     }
 
-    for (Patch &Patch : PendingPatches) {
+    EntryPatches.emplace_back(&Function, std::move(PendingPatches));
+  }
+
+  // A function that cannot be patched is retained. Scanning its references
+  // can retain functions visited earlier, so install patches only after all
+  // patchability checks and their transitive scans have finished.
+  for (auto &[Function, Patches] : EntryPatches) {
+    if (!BC.shouldEmit(*Function))
+      continue;
+
+    for (Patch &Patch : Patches) {
       // Add instruction patch to the binary.
       InstructionListType Instructions;
       BC.MIB->createLongTailCall(Instructions, Patch.Symbol, BC.Ctx.get());

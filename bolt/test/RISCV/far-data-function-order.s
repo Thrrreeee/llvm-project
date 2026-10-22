@@ -25,7 +25,7 @@
 
 # DEFAULT: RISC-V far-data placement: 2 functions placed before remaining emitted functions
 # USER-DAG: RISC-V far-data placement: 2 functions placed before remaining emitted functions
-# USER-DAG: RISC-V far-data placement changes the requested function order; relative order within each group is preserved
+# USER-DAG: RISC-V far-data placement changes the requested function order to satisfy fixed-reference placement priorities
 
 #--- input.s
   .attribute arch, "rv64iac"

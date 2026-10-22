@@ -44,7 +44,7 @@ def target(pc, high, low):
 old, early, normal = (ELF(path) for path in sys.argv[1:])
 names = ["padding", "main", "callee_secondary", "callee_primary"]
 assert sorted(names, key=normal.address) == names
-expected = ["callee_secondary", "callee_primary", "padding", "main"]
+expected = ["callee_secondary", "callee_primary", "main", "padding"]
 assert sorted(names, key=early.address) == expected
 
 old_address, old_size, before = old.function("preserved")

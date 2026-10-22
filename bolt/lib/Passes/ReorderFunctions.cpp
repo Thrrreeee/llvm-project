@@ -855,7 +855,16 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
         if (BC.shouldEmit(*BF))
           BC.RISCVFarDataEarlyFunctions.insert(BF);
 
-  if (!BC.RISCVFarDataEarlyFunctions.empty()) {
+  DenseMap<const BinaryFunction *, uint64_t> FixedCalleeCallers;
+  for (const auto &[Symbol, Address] : BC.RISCVFixedCalleeCallers)
+    if (BinaryFunction *BF = BC.getFunctionForSymbol(Symbol))
+      if (BC.shouldEmit(*BF)) {
+        auto [It, Inserted] = FixedCalleeCallers.try_emplace(BF, Address);
+        if (!Inserted)
+          It->second = std::min(It->second, Address);
+      }
+
+  if (!BC.RISCVFarDataEarlyFunctions.empty() || !FixedCalleeCallers.empty()) {
     BinaryFunctionListType OrderedFunctions;
     for (BinaryFunction &BF : llvm::make_second_range(BFs))
       if (BC.shouldEmit(BF))
@@ -864,14 +873,39 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
     auto IsEarly = [&BC](const BinaryFunction *BF) {
       return BC.RISCVFarDataEarlyFunctions.contains(BF);
     };
-    const bool ChangesOrder = !std::is_partitioned(
-        OrderedFunctions.begin(), OrderedFunctions.end(), IsEarly);
+    auto IsFixedCaller = [&](const BinaryFunction *BF) {
+      return FixedCalleeCallers.contains(BF);
+    };
+    auto Priority = [&](const BinaryFunction *BF) {
+      if (IsEarly(BF))
+        return std::make_pair(0, uint64_t(0));
+      auto It = FixedCalleeCallers.find(BF);
+      return It != FixedCalleeCallers.end() ? std::make_pair(1, It->second)
+                                            : std::make_pair(2, uint64_t(0));
+    };
+    const bool ChangesOrder =
+        !llvm::is_sorted(OrderedFunctions,
+                         [&](const BinaryFunction *A, const BinaryFunction *B) {
+                           return Priority(A) < Priority(B);
+                         });
     const bool ChangesUserOrder =
         ChangesOrder && llvm::any_of(OrderedFunctions, [&](BinaryFunction *BF) {
           return UserOrderedFuncs.contains(BF) && !IsEarly(BF);
         });
     const auto EarlyEnd = std::stable_partition(
         OrderedFunctions.begin(), OrderedFunctions.end(), IsEarly);
+    const auto CallersEnd =
+        std::stable_partition(EarlyEnd, OrderedFunctions.end(), IsFixedCaller);
+    // Do not push the original fixed-data/call-target prefix later. Within
+    // the following caller group, lower input callees have earlier backward
+    // CALL deadlines (callee address + 0x80000800). Sort those first, leaving
+    // the user order unchanged for equal bounds. Final relocation checks are
+    // still required, including for explicit split layouts.
+    std::stable_sort(EarlyEnd, CallersEnd,
+                     [&](const BinaryFunction *A, const BinaryFunction *B) {
+                       return FixedCalleeCallers.lookup(A) <
+                              FixedCalleeCallers.lookup(B);
+                     });
     uint32_t Index = 0;
     for (BinaryFunction *BF : OrderedFunctions) {
       BF->clearIndex();
@@ -880,10 +914,15 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
     BC.outs() << "BOLT-INFO: RISC-V far-data placement: "
               << std::distance(OrderedFunctions.begin(), EarlyEnd)
               << " functions placed before remaining emitted functions\n";
+    if (CallersEnd != EarlyEnd)
+      BC.outs() << "BOLT-INFO: RISC-V fixed-callee placement: "
+                << std::distance(EarlyEnd, CallersEnd)
+                << " callers ordered by original callee address after the "
+                   "fixed-data and call-target prefix\n";
     if (ChangesUserOrder)
       BC.errs() << "BOLT-WARNING: RISC-V far-data placement changes the "
-                   "requested function order; relative order within each "
-                   "group is preserved\n";
+                   "requested function order to satisfy fixed-reference "
+                   "placement priorities\n";
   }
 
   BC.HasFinalizedFunctionOrder = true;

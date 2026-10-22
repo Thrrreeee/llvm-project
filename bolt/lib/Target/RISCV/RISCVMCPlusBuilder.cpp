@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/RISCVBaseInfo.h"
 #include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCAsmInfo.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
@@ -1460,6 +1461,26 @@ public:
         createIncMemory(RISCV::X10, RISCV::X11, RISCV::X0);
     Insts.insert(Insts.end(), IncInsts.begin(), IncInsts.end());
     reloadRegs(Insts, {RISCV::X10, RISCV::X11});
+
+    // MC streamers do not perform the compression done by the assembly parser.
+    // Compress only these newly generated instructions with fixed operands;
+    // the AUIPC/ADDI pair must retain its PCREL fixups and anchor annotation.
+    if (STI->hasFeature(RISCV::FeatureStdExtC) ||
+        STI->hasFeature(RISCV::FeatureStdExtZca)) {
+      for (MCInst &Inst : Insts) {
+        if (llvm::any_of(Inst, [](const MCOperand &Op) { return Op.isExpr(); }))
+          continue;
+        MCInst PrimeInst = Inst;
+        stripAnnotations(PrimeInst);
+        MCInst Compressed;
+        if (!RISCVRVC::compress(Compressed, PrimeInst, *STI))
+          continue;
+        Compressed.setFlags(Inst.getFlags());
+        Compressed.setLoc(Inst.getLoc());
+        moveAnnotations(std::move(Inst), Compressed);
+        Inst = std::move(Compressed);
+      }
+    }
     return Insts;
   }
 

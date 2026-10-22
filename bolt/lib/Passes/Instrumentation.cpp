@@ -378,6 +378,26 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
   if (BC.isMachO() && Function.hasName("___GLOBAL_init_65535/1"))
     return;
 
+  // A constrained RISC-V LR/SC loop must not acquire extra memory accesses
+  // between LR and SC. Counter spills and updates can break its eventual
+  // success guarantee. Such a sequence can span basic blocks, including
+  // forward branches, so conservatively leave the entire function without
+  // instrumentation. Also handle unmatched LR/SC rather than assuming that
+  // every reservation sequence is contained in one basic block or function.
+  if (BC.isRISCV()) {
+    for (const BinaryBasicBlock &BB : Function) {
+      for (const MCInst &Inst : BB) {
+        if (!BC.MIB->isRISCVLRSC(Inst))
+          continue;
+        if (opts::Verbosity >= 2)
+          BC.outs() << "BOLT-INSTRUMENTER: skipping function "
+                    << Function.getPrintName()
+                    << " containing a RISC-V LR/SC instruction\n";
+        return;
+      }
+    }
+  }
+
   DenseSet<const BinaryBasicBlock *> BBToSkip;
   if (BC.isAArch64() && hasAArch64ExclusiveMemop(Function, BBToSkip))
     return;

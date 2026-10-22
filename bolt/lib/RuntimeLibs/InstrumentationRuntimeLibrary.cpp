@@ -162,8 +162,13 @@ void InstrumentationRuntimeLibrary::emitBinary(BinaryContext &BC,
   // Label marking start of the memory region containing instrumentation
   // counters, total vector size is Counters.size() 8-byte counters
   emitLabelByName("__bolt_instr_locations");
-  for (MCSymbol *const &Label : Summary->Counters)
-    emitFill(sizeof(uint64_t), Label);
+  for (MCSymbol *const &Label : Summary->Counters) {
+    emitDataSize(sizeof(uint64_t));
+    emitLabel(Label, /*IsGlobal=*/false);
+    // Fixed-size counters can share data fragments. emitFill would allocate a
+    // separate fill fragment and constant expression for every counter.
+    Streamer.emitIntValue(0, sizeof(uint64_t));
+  }
 
   emitPadding(BC.RegularPageSize);
   emitIntValue("__bolt_instr_max_size", opts::InstrumentationMaxSize);

@@ -495,12 +495,17 @@ static Error reportRISCVInstrumentationLayout(BinaryContext &BC) {
         // can use __BOLT_got_zero + the original GOT address.
         ErrorOr<BinarySection &> Section = BC.getSectionForAddress(Target);
         const BinaryData *TargetBD = BC.getBinaryDataContainingAddress(Target);
+        const bool TargetsJumpTable =
+            BC.getJumpTableContainingAddress(Target) ||
+            (Target != SymbolBD->getAddress() &&
+             BC.getJumpTableContainingAddress(SymbolBD->getAddress()));
         auto MayMove = [](const BinaryData *BD) {
           return BD && (BD->isMoved() || BD->getRootData()->isMoved() ||
                         BD->isJumpTable() || BD->getRootData()->isJumpTable());
         };
         if (!Section || !Section->isAllocatable() || Section->isText() ||
-            Section->isReordered() || MayMove(SymbolBD) || MayMove(TargetBD) ||
+            Section->isReordered() || TargetsJumpTable || MayMove(SymbolBD) ||
+            MayMove(TargetBD) ||
             BC.forceSymbolRelocations(Symbol.getName()) ||
             BC.getFunctionForSymbol(&Symbol) ||
             BC.getBinaryFunctionContainingAddress(Target)) {

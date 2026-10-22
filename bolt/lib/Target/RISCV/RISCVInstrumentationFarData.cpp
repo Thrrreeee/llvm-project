@@ -64,12 +64,20 @@ static std::optional<uint64_t> getFixedTarget(BinaryContext &BC,
   const uint64_t Target = SymbolBD->getAddress() + Value.getConstant();
   ErrorOr<BinarySection &> Section = BC.getSectionForAddress(Target);
   const BinaryData *TargetBD = BC.getBinaryDataContainingAddress(Target);
+  // JumpTable objects are registered separately from the BinaryData associated
+  // with an input symbol. The latter can still be ordinary data after a table
+  // has been recognized. Keep its symbolic base for duplication and movement.
+  const bool TargetsJumpTable =
+      BC.getJumpTableContainingAddress(Target) ||
+      (Target != SymbolBD->getAddress() &&
+       BC.getJumpTableContainingAddress(SymbolBD->getAddress()));
   auto MayMove = [](const BinaryData *BD) {
     return BD && (BD->isMoved() || BD->getRootData()->isMoved() ||
                   BD->isJumpTable() || BD->getRootData()->isJumpTable());
   };
   if (!Section || !Section->isAllocatable() || Section->isText() ||
-      Section->isReordered() || MayMove(SymbolBD) || MayMove(TargetBD) ||
+      Section->isReordered() || TargetsJumpTable || MayMove(SymbolBD) ||
+      MayMove(TargetBD) ||
       BC.forceSymbolRelocations(Symbol.getName()) ||
       BC.getFunctionForSymbol(&Symbol) ||
       BC.getBinaryFunctionContainingAddress(Target))

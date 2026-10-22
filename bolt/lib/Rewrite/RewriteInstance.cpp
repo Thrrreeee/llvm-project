@@ -1234,6 +1234,15 @@ void RewriteInstance::discoverFileObjects() {
             ? "PG" + std::string(SymName)
             : std::string(SymName);
 
+    // Still advance the name resolver for omitted labels. A retained symbol
+    // with the same spelling must keep its original disambiguation suffix.
+    if (SkipLocalRegistration) {
+      assert(!Name.empty() && !(SymbolFlags & SymbolRef::SF_Global));
+      NR.registerNameOccurrence(Name);
+      ++NumSkippedLocalLabels;
+      continue;
+    }
+
     // Disambiguate all local symbols before adding to symbol table.
     // Since we don't know if we will see a global with the same name,
     // always modify the local name.
@@ -1271,21 +1280,16 @@ void RewriteInstance::discoverFileObjects() {
       // The <id> field is used for disambiguation of local symbols since there
       // could be identical function names coming from identical file names
       // (e.g. from different directories).
-      auto SFI = llvm::upper_bound(FileSymbols, ELFSymbolRef(Symbol));
-      if (SymbolType == SymbolRef::ST_Function && SFI != FileSymbols.begin()) {
-        StringRef FileSymbolName = cantFail(SFI[-1].getName());
-        if (!FileSymbolName.empty())
-          AlternativeName = NR.uniquify(Name + "/" + FileSymbolName.str());
+      if (SymbolType == SymbolRef::ST_Function) {
+        auto SFI = llvm::upper_bound(FileSymbols, ELFSymbolRef(Symbol));
+        if (SFI != FileSymbols.begin()) {
+          StringRef FileSymbolName = cantFail(SFI[-1].getName());
+          if (!FileSymbolName.empty())
+            AlternativeName = NR.uniquify(Name + "/" + FileSymbolName.str());
+        }
       }
 
       UniqueName = NR.uniquify(Name);
-    }
-
-    // Still advance the name resolver for omitted labels. A retained symbol
-    // with the same spelling must keep its original disambiguation suffix.
-    if (SkipLocalRegistration) {
-      ++NumSkippedLocalLabels;
-      continue;
     }
 
     uint64_t SymbolSize = ELFSymbolRef(Symbol).getSize();

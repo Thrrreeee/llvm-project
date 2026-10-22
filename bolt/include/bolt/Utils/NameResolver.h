@@ -53,16 +53,21 @@ public:
     return (Name + Twine(Sep) + Twine(ID)).str();
   }
 
+  /// Record an occurrence of \p Name and return its disambiguation ID without
+  /// constructing the unique name.
+  uint64_t registerNameOccurrence(StringRef Name) {
+    return ++Counters[getKey(Name)];
+  }
+
   /// Register new version of \p Name and return unique version in the form
   /// "Name<Sep><Number>".
   std::string uniquify(StringRef Name) {
-    const uint64_t ID = ++Counters[getKey(Name)];
-    return getUniqueName(Name, ID);
+    return getUniqueName(Name, registerNameOccurrence(Name));
   }
 
   /// Release the memory used to track name occurrences. Call once no more names
   /// need to be uniquified (e.g. after file object discovery is complete).
-  void clear() { Counters.clear(); }
+  void clear() { decltype(Counters)().swap(Counters); }
 
   /// For uniquified \p Name, return the original form (that may no longer be
   /// unique).

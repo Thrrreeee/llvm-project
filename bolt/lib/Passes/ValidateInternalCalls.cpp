@@ -14,6 +14,7 @@
 #include "bolt/Core/BinaryBasicBlock.h"
 #include "bolt/Passes/DataflowInfoManager.h"
 #include "bolt/Passes/FrameAnalysis.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/MC/MCInstPrinter.h"
 #include <optional>
 #include <queue>
@@ -318,6 +319,29 @@ Error ValidateInternalCalls::runOnFunctions(BinaryContext &BC) {
         }
       }
     }
+  }
+
+  if (BC.isRISCV()) {
+    if (opts::Instrument) {
+      // Non-simple functions are still re-emitted in relocation mode. Call
+      // normalization and MC relaxation can grow their branches even without
+      // counters, but their internal calls preclude reliable CFG liveness.
+      // Keep the original body and let the ignored-function scanner patch
+      // complete call pairs or preserve targets of fixed short references.
+      // Collect all candidates first: setIgnored() releases their CFGs and can
+      // recursively preserve other functions.
+      for (BinaryFunction *Function : NeedsValidation)
+        if (!Function->isIgnored())
+          Function->setIgnored();
+      if (!NeedsValidation.empty())
+        BC.outs() << "BOLT-INFO: preserving original code for "
+                  << NeedsValidation.size()
+                  << " RISC-V functions with internal calls\n";
+    }
+    // These scans can discover entries inside previously recorded call pairs.
+    // Commit fixed references only after the resulting closure is complete.
+    BC.processFixedReferences(/*EntriesComplete=*/true);
+    return Error::success();
   }
 
   if (!BC.isX86())

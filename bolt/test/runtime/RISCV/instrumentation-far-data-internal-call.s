@@ -1,23 +1,28 @@
 # REQUIRES: system-linux,bolt-runtime
 
 ## An internal call makes large non-simple. Its original jump fits within JAL
-## range, but converting the fixed-data references before classifying the
-## function would grow that jump beyond its last two bytes of headroom. Keep its
-## instructions intact while still converting the ordinary reference in main.
+## range, with only two bytes of headroom. Both far-data conversion and call
+## normalization can grow its body. Keep the original bytes, except for the
+## fixed-size call pair that must follow body_callee to its instrumented address.
 # RUN: %clang %cflags -pie -Wl,-q,--no-relax -o %t.exe %s
 # RUN: %t.exe
 # RUN: llvm-bolt %t.exe --instrument --riscv-instrumentation-far-data \
-# RUN:   --funcs=main,large --instrumentation-file=%t.fdata \
+# RUN:   --funcs=main,large,body_callee --instrumentation-file=%t.fdata \
 # RUN:   -o %t.instr 2>&1 | FileCheck %s
+# RUN: %python %S/Inputs/internal-call-original-check.py %t.exe %t.instr
 # RUN: rm -f %t.fdata
 # RUN: %t.instr
 # RUN: FileCheck %s --check-prefix=PROFILE --input-file=%t.fdata
+# RUN: llvm-bolt %t.exe --data=%t.fdata --funcs=main,body_callee -o %t.opt
+# RUN: %t.opt
 
 # CHECK: BOLT-WARNING: internal call detected in function large
-# CHECK: RISC-V far-data slots replaced 1 AUIPC references and restored 1 low operands; kept 0 LR/SC functions, 1 non-simple functions
-# CHECK: BOLT-INSTRUMENTER: Number of function descriptors: 1
-# CHECK: RISC-V far-data placement: 1 functions placed before remaining emitted functions
+# CHECK: preserving original code for 1 RISC-V functions with internal calls
+# CHECK: RISC-V far-data slots replaced 1 AUIPC references and restored 1 low operands; kept 0 LR/SC functions, 0 non-simple functions
+# CHECK: BOLT-INSTRUMENTER: Number of function descriptors: 2
+# CHECK-NOT: RISC-V far-data placement:
 # PROFILE-COUNT-2: 1 main {{[0-9a-f]+}} 1 large 0 0 1{{$}}
+# PROFILE: body_callee 0 0 1{{$}}
 
   .option norelax
   .option norvc
@@ -74,7 +79,8 @@ large:
 .Llarge_value:
   auipc t0, %pcrel_hi(value)
   ld a0, %pcrel_lo(.Llarge_value)(t0)
-  .rept 262138
+  call body_callee
+  .rept 262136
   nop
   .endr
 .Lfar:
@@ -85,6 +91,13 @@ large:
   ret
   .cfi_endproc
   .size large, .-large
+
+  .globl body_callee
+  .type body_callee,@function
+body_callee:
+  li a0, 42
+  ret
+  .size body_callee, .-body_callee
 
   .section .rodata,"a",@progbits
   .p2align 3

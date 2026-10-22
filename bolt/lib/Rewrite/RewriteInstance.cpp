@@ -4405,7 +4405,10 @@ void RewriteInstance::runOptimizationPasses() {
                      TimerGroupName, TimerGroupDesc, opts::TimeRewrite);
   // Original interprocedural entries, including jump-table and metadata
   // references, are known now. Preserve unsafe targets before ICF or layout.
-  BC->processFixedReferences(/*EntriesComplete=*/true);
+  // RISC-V also scans functions rejected by ValidateInternalCalls, which runs
+  // after call normalization and before instrumentation, ICF, or layout.
+  if (!BC->isRISCV())
+    BC->processFixedReferences(/*EntriesComplete=*/true);
   BC->logBOLTErrorsAndQuitOnFatal(BinaryFunctionPassManager::runAllPasses(*BC));
 }
 

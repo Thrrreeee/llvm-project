@@ -261,6 +261,8 @@ public:
   }
 
   unsigned getFDEEncoding() const { return FDECFIEncoding; }
+  /// Set the encoding of FDE initial locations before emitting call frames.
+  void setFDEEncoding(unsigned Encoding) { FDECFIEncoding = Encoding; }
 
   unsigned getCompactUnwindDwarfEHFrameOnly() const {
     return CompactUnwindDwarfEHFrameOnly;

@@ -213,6 +213,11 @@ Error RISCVInstrumentationFarData::runOnFunctions(BinaryContext &BC) {
   BC.KeepOriginalEHFrame = true;
   BC.UseLargeCodeModel = true;
   BC.updateLSDAEncoding();
+  // Named entry patches also get new FDEs, but their code stays at the input
+  // address. The emitted EH section can be more than 2 GiB away from them.
+  // MOFI was initialized before enabling the large code model above, so select
+  // wide initial-location fields explicitly as well as wide LSDA references.
+  BC.MOFI->setFDEEncoding(dwarf::DW_EH_PE_pcrel | dwarf::DW_EH_PE_sdata8);
 
   uint64_t NumHighs = 0, NumLows = 0, NumLRSC = 0, NumNonSimple = 0;
   uint64_t NumUnverified = 0;

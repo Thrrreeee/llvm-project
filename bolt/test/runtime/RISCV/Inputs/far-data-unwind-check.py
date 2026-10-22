@@ -59,7 +59,7 @@ class ELF:
             table[pc] = fde
         return frame, table, size
 
-    def frame(self, fde):
+    def frame(self, fde, details=False):
         # Decode the CIE's R augmentation, then the FDE initial location.
         length, delta = struct.unpack("<II", self.bytes_at(fde, 8))
         cie = Cursor(self, fde + 4 - delta + 8)
@@ -94,12 +94,14 @@ class ELF:
                 raise AssertionError(("unexpected CIE augmentation", ch))
         cursor = Cursor(self, fde + 8)
         pc = cursor.encoded(encoding)
-        cursor.encoded(encoding & 15)
+        extent = cursor.encoded(encoding & 15)
         lsda = None
         if augmentation and augmentation[0] == "z":
             cursor.leb()
             if lsda_encoding != 0xFF:
                 lsda = cursor.encoded(lsda_encoding)
+        if details:
+            return pc, personality, lsda, encoding, extent
         return pc, personality, lsda
 
 
@@ -134,6 +136,14 @@ class Cursor:
 
 old, new = (ELF(path) for path in sys.argv[1:3])
 old_name, new_name = sys.argv[3:5]
+if "--default-fde32" in sys.argv:
+    _, table, _ = new.header()
+    assert table
+    for fde in table.values():
+        assert new.frame(fde, details=True)[3] == 0x1B
+    assert any(name.endswith(".org.0") for name in new.symbols)
+    print("default FDE encoding remains pcrel sdata4")
+    sys.exit(0)
 old_eh = old.sections[".eh_frame"]
 original_bytes = old.bytes_at(old_eh[3], old_eh[5])
 assert new.bytes_at(old_eh[3], old_eh[5]) == original_bytes
@@ -202,4 +212,35 @@ if "--exception-targets" in sys.argv:
     assert new.bytes_at(target, 8) == old.bytes_at(target, 8)
     assert new.bytes_at(tt_target, 8) == old.bytes_at(tt_target, 8)
     print("far personality and typeinfo resolve to original slots")
+if "--entry-patch-fde64" in sys.argv:
+    assert width == 4
+    assert old.frame(old_table[old_pc], details=True)[3] == 0x1B
+    patches = [(name, value, size) for name, (value, size) in new.symbols.items()
+               if name.endswith(".org.0")]
+    assert patches
+    checked_new_entry = False
+    for name, source, size in patches:
+        original_name = name[:-len(".org.0")]
+        assert source == old.symbols[original_name][0], name
+        fde = new_table[source]
+        assert fde >= new_frame
+        pc, _, _, encoding, extent = new.frame(fde, details=True)
+        assert encoding == 0x1C, (name, hex(encoding))
+        assert pc == source and extent == size == 8, (name, pc, extent, size)
+        assert fde + 8 - source > 1 << 31, (name, hex(fde), hex(source))
+        # The entry patch itself must remain within AUIPC/JALR range. Decode
+        # it independently so a too-distant call cannot mask the FDE case.
+        high, low = struct.unpack("<II", new.bytes_at(source, 8))
+        assert high & 0xFFF == 0x317  # auipc t1
+        assert low & 0xFFFFF == 0x30067  # jalr zero, t1
+        upper = struct.unpack("<i", struct.pack("<I", high & 0xFFFFF000))[0]
+        lower = struct.unpack("<i", struct.pack("<I", low))[0] >> 20
+        target = source + upper + lower
+        assert target == new.symbols[original_name][0], (name, hex(target))
+        checked_new_entry |= original_name == new_name
+    assert checked_new_entry
+    for fde in new_table.values():
+        if fde >= new_frame:
+            assert new.frame(fde, details=True)[3] == 0x1C
+    print("named entry patch FDEs use sdata8 and retain original PCs and extents")
 print("old EH bytes preserved; old and new FDEs indexed")

@@ -72,6 +72,23 @@ class RISCVMCPlusBuilder : public MCPlusBuilder {
   LocalUDChain computeLocalUDChain(const MCInst *CurInstr,
                                    InstructionIterator Begin,
                                    InstructionIterator End) const {
+    // Earlier blocks are discarded by TerminatorSeen below. Avoid scanning
+    // them repeatedly for every indirect branch of a very large function.
+    // Retain the previous block if the current branch immediately follows a
+    // terminator, matching the original loop's treatment of that case.
+    bool HasFollowingInstruction = false;
+    for (auto I = End; I != Begin;) {
+      --I;
+      if (isPseudo(*I) || isNoop(*I))
+        continue;
+      if (HasFollowingInstruction && isTerminator(*I)) {
+        Begin = I;
+        ++Begin;
+        break;
+      }
+      HasFollowingInstruction = true;
+    }
+
     DenseMap<int, MCInst *> RegAliasTable;
     LocalUDChain Uses;
 

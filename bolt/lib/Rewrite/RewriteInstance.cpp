@@ -37,6 +37,7 @@
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/ADT/AddressRanges.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
@@ -960,6 +961,43 @@ void RewriteInstance::discoverFileObjects() {
   NamedRegionTimer T("discoverFileObjects", "discover file objects",
                      TimerGroupName, TimerGroupDesc, opts::TimeRewrite);
 
+  // Keep symbol indices used by relocations applied to loaded sections. Debug
+  // relocations need the original ELF symbol table, which remains unchanged;
+  // they do not require allocating a BinaryData/MCSymbol for every local label.
+  // Use one bit per input symbol rather than a hash entry per relocation.
+  const DataRefImpl SymbolTableEnd =
+      InputFile->symbol_end()->getRawDataRefImpl();
+  BitVector ReferencedSymbols;
+  if (BC->isRISCV()) {
+    ReferencedSymbols.resize(SymbolTableEnd.d.b);
+    for (const SectionRef &Section : InputFile->sections()) {
+      const ELFSectionRef ELFSection(Section);
+      if (ELFSection.getType() != ELF::SHT_REL &&
+          ELFSection.getType() != ELF::SHT_RELA &&
+          ELFSection.getType() != ELF::SHT_CREL)
+        continue;
+      const section_iterator Relocated =
+          cantFail(Section.getRelocatedSection());
+      if (!(ELFSection.getFlags() & ELF::SHF_ALLOC) &&
+          (Relocated == InputFile->section_end() ||
+           !(ELFSectionRef(*Relocated).getFlags() & ELF::SHF_ALLOC)))
+        continue;
+      for (const RelocationRef &Rel : Section.relocations()) {
+        const symbol_iterator SymbolIt = Rel.getSymbol();
+        // A relocation without a symbol is represented by symbol_end().
+        if (SymbolIt == InputFile->symbol_end())
+          continue;
+        const DataRefImpl Symbol = SymbolIt->getRawDataRefImpl();
+        if (Symbol.d.a != SymbolTableEnd.d.a)
+          continue;
+        if (Symbol.d.b >= ReferencedSymbols.size())
+          report_fatal_error("relocation symbol index exceeds symbol table");
+        ReferencedSymbols.set(Symbol.d.b);
+      }
+    }
+  }
+  uint64_t NumSkippedLocalLabels = 0;
+
   // For local symbols we want to keep track of associated FILE symbol name for
   // disambiguation by combined name.
   for (const ELFSymbolRef &Symbol : InputFile->symbols()) {
@@ -1146,7 +1184,30 @@ void RewriteInstance::discoverFileObjects() {
         !opts::HeatmapMode)
       continue;
 
-    FileSymRefs.emplace(SymbolAddress, Symbol);
+    // Prune only private, zero-sized labels strictly inside an already known
+    // function. Outside labels can identify untyped assembly functions and
+    // boundary labels can affect their inferred extents. Keep data-in-code
+    // labels too: addExtraDataMarkerPerSymbol() has already recorded a DATA
+    // marker at every such symbol, before mapping symbols were partitioned out.
+    // All symbols still participate in sorting and marker discovery above.
+    const ELFSymbolRef ELFSymbol(Symbol);
+    const DataRefImpl SymbolIndex = Symbol.getRawDataRefImpl();
+    const bool SkipLocalRegistration =
+        BC->isRISCV() && ELFSymbol.getBinding() == ELF::STB_LOCAL &&
+        ELFSymbol.getELFType() == ELF::STT_NOTYPE && !ELFSymbol.getSize() &&
+        !(SymbolFlags & (SymbolRef::SF_Absolute | SymbolRef::SF_Undefined)) &&
+        SymName.starts_with(".L") &&
+        SymbolIndex.d.a == SymbolTableEnd.d.a &&
+        SymbolIndex.d.b < ReferencedSymbols.size() &&
+        !ReferencedSymbols.test(SymbolIndex.d.b) && PreviousFunction &&
+        SymbolAddress > PreviousFunction->getAddress() &&
+        PreviousFunction->containsAddress(SymbolAddress) &&
+        *cantFail(Symbol.getSection()) ==
+            PreviousFunction->getOriginSection()->getSectionRef() &&
+        PreviousFunction->isSymbolValidInScope(Symbol, 0) &&
+        MarkerSymbols.lookup(SymbolAddress) != MarkerSymType::DATA;
+    if (!SkipLocalRegistration)
+      FileSymRefs.emplace(SymbolAddress, Symbol);
 
     // Skip symbols in PLT sections that will be registered by disassemblePLT().
     // ST_Debug covers section markers (lld/GNU ld), ST_Function covers
@@ -1212,6 +1273,13 @@ void RewriteInstance::discoverFileObjects() {
       }
 
       UniqueName = NR.uniquify(Name);
+    }
+
+    // Still advance the name resolver for omitted labels. A retained symbol
+    // with the same spelling must keep its original disambiguation suffix.
+    if (SkipLocalRegistration) {
+      ++NumSkippedLocalLabels;
+      continue;
     }
 
     uint64_t SymbolSize = ELFSymbolRef(Symbol).getSize();
@@ -1432,6 +1500,11 @@ void RewriteInstance::discoverFileObjects() {
     registerName(SymbolSize);
     PreviousFunction = BF;
   }
+
+  if (NumSkippedLocalLabels)
+    BC->outs() << "BOLT-INFO: omitted internal registration of "
+               << NumSkippedLocalLabels
+               << " unreferenced private code labels\n";
 
   // Read dynamic relocation first as their presence affects the way we process
   // static relocations. E.g. we will ignore a static relocation at an address

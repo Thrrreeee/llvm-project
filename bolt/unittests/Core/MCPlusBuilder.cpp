@@ -126,6 +126,60 @@ protected:
 };
 } // namespace
 
+TEST_P(MCPlusBuilderTester, InsertInstructionRange) {
+  BinaryFunction *BF = BC->createInjectedBinaryFunction("BF", true);
+  std::unique_ptr<BinaryBasicBlock> BB = BF->createBasicBlock();
+  InstructionListType Instrs(2);
+  BC->MIB->createNoop(Instrs[0]);
+  Instrs[0].setFlags(0x5a);
+  const char Source[] = "source";
+  Instrs[0].setLoc(SMLoc::getFromPointer(Source));
+  const uint64_t &Annotation =
+      BC->MIB->addAnnotation(Instrs[0], "range-copy", uint64_t(42));
+  BC->MIB->createCFI(Instrs[1], 3);
+
+  EXPECT_EQ(BB->insertInstructions(BB->end(), Instrs.begin(), Instrs.begin()),
+            BB->end());
+  EXPECT_TRUE(BB->empty());
+  EXPECT_EQ(BB->getNumPseudos(), 0U);
+
+  auto First = BB->insertInstructions(BB->end(), Instrs.begin(), Instrs.end());
+  EXPECT_EQ(First, BB->begin());
+  EXPECT_EQ(First + Instrs.size(), BB->end());
+  EXPECT_EQ(BB->getNumPseudos(), 1U);
+  EXPECT_EQ(First->getFlags(), 0x5aU);
+  EXPECT_EQ(First->getLoc().getPointer(), Source);
+  EXPECT_EQ(&BC->MIB->getAnnotationAs<uint64_t>(*First, "range-copy"),
+            &Annotation);
+  EXPECT_EQ(Instrs[0].getFlags(), 0x5aU);
+  EXPECT_EQ(&BC->MIB->getAnnotationAs<uint64_t>(Instrs[0], "range-copy"),
+            &Annotation);
+  EXPECT_EQ(Instrs[1].getOperand(0).getImm(), 3);
+
+  MCInst Tail;
+  BC->MIB->createNoop(Tail);
+  Tail.setFlags(0xa5);
+  BB->addInstruction(Tail);
+  First = BB->insertInstructions(std::prev(BB->end()), Instrs.begin(),
+                                 Instrs.end());
+  EXPECT_EQ(First, BB->begin() + 2);
+  EXPECT_EQ(First + Instrs.size(), std::prev(BB->end()));
+  EXPECT_EQ((First + Instrs.size())->getFlags(), 0xa5U);
+  EXPECT_EQ(BB->getNumPseudos(), 2U);
+  EXPECT_EQ(BB->getNumNonPseudos(), 3U);
+  auto Next = BB->eraseInstruction(First + 1);
+  EXPECT_EQ(Next, std::prev(BB->end()));
+  EXPECT_EQ(BB->getNumPseudos(), 1U);
+
+  auto At = BB->begin() + 1;
+  EXPECT_EQ(BB->insertInstructions(At, Instrs.end(), Instrs.end()), At);
+  EXPECT_EQ(BB->insertInstructions(BB->end(), Instrs.end(), Instrs.end()),
+            BB->end());
+  First = BB->insertInstructions(BB->end(), Instrs.begin(), Instrs.end());
+  EXPECT_EQ(First + Instrs.size(), BB->end());
+  EXPECT_EQ(BB->getNumPseudos(), 2U);
+}
+
 #ifdef AARCH64_AVAILABLE
 
 INSTANTIATE_TEST_SUITE_P(AArch64, MCPlusBuilderTester,

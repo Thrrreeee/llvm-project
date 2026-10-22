@@ -261,13 +261,23 @@ void Instrumentation::createLeafNodeDescription(FunctionDescription &FuncDesc,
   FuncDesc.LeafNodes.emplace_back(IN);
 }
 
-InstructionListType
-Instrumentation::createInstrumentationSnippet(BinaryContext &BC, bool IsLeaf) {
+InstructionListType Instrumentation::createInstrumentationSnippet(
+    BinaryContext &BC, bool IsLeaf, ArrayRef<MCPhysReg> ScratchCandidates,
+    ArrayRef<MCInst> FollowingInstructions) {
+  const auto DeadRegs = BC.MIB->getDeadInstrumentationScratchRegs(
+      FollowingInstructions, ScratchCandidates);
   auto L = BC.scopeLock();
   MCSymbol *Label = BC.Ctx->createNamedTempSymbol("InstrEntry");
   Summary->Counters.emplace_back(Label);
-  return BC.MIB->createInstrIncMemory(Label, BC.Ctx.get(), IsLeaf,
-                                      BC.AsmInfo->getCodePointerSize());
+  return BC.MIB->createInstrIncMemoryWithScratch(
+      Label, BC.Ctx.get(), IsLeaf, BC.AsmInfo->getCodePointerSize(), DeadRegs);
+}
+
+static ArrayRef<MCInst> instructionsAfter(BinaryBasicBlock &BB,
+                                          BinaryBasicBlock::iterator Iter) {
+  if (Iter == BB.end())
+    return {};
+  return {&*Iter, static_cast<size_t>(BB.end() - Iter)};
 }
 
 // Helper instruction sequence insertion function
@@ -276,17 +286,18 @@ insertInstructions(const InstructionListType &Instrs, BinaryBasicBlock &BB,
                    BinaryBasicBlock::iterator Iter) {
   if (Instrs.empty())
     return Iter;
-  return BB.insertInstructions(Iter, Instrs.begin(), Instrs.end()) + Instrs.size();
+  return BB.insertInstructions(Iter, Instrs.begin(), Instrs.end()) +
+         Instrs.size();
 }
 
-void Instrumentation::instrumentLeafNode(BinaryBasicBlock &BB,
-                                         BinaryBasicBlock::iterator Iter,
-                                         bool IsLeaf,
-                                         FunctionDescription &FuncDesc,
-                                         uint32_t Node) {
+void Instrumentation::instrumentLeafNode(
+    BinaryBasicBlock &BB, BinaryBasicBlock::iterator Iter, bool IsLeaf,
+    FunctionDescription &FuncDesc, uint32_t Node,
+    ArrayRef<MCPhysReg> ScratchCandidates) {
   createLeafNodeDescription(FuncDesc, Node);
   InstructionListType CounterInstrs = createInstrumentationSnippet(
-      BB.getFunction()->getBinaryContext(), IsLeaf);
+      BB.getFunction()->getBinaryContext(), IsLeaf, ScratchCandidates,
+      instructionsAfter(BB, Iter));
   insertInstructions(CounterInstrs, BB, Iter);
 }
 
@@ -316,7 +327,8 @@ bool Instrumentation::instrumentOneTarget(
     BinaryBasicBlock::iterator &Iter, BinaryFunction &FromFunction,
     BinaryBasicBlock &FromBB, uint32_t From, BinaryFunction &ToFunc,
     BinaryBasicBlock *TargetBB, uint32_t ToOffset, bool IsLeaf, bool IsInvoke,
-    FunctionDescription *FuncDesc, uint32_t FromNodeID, uint32_t ToNodeID) {
+    FunctionDescription *FuncDesc, uint32_t FromNodeID,
+    ArrayRef<MCPhysReg> ScratchCandidates, uint32_t ToNodeID) {
   BinaryContext &BC = FromFunction.getBinaryContext();
   {
     auto L = BC.scopeLock();
@@ -332,14 +344,13 @@ bool Instrumentation::instrumentOneTarget(
       return false;
   }
 
-  InstructionListType CounterInstrs = createInstrumentationSnippet(BC, IsLeaf);
-
   const MCInst &Inst = *Iter;
   if (BC.MIB->isCall(Inst)) {
     // This code handles both
     // - (regular) inter-function calls (cross-function control transfer),
     // - (rare) intra-function calls (function-local control transfer)
-    Iter = insertInstructions(CounterInstrs, FromBB, Iter);
+    Iter = insertInstructions(createInstrumentationSnippet(BC, IsLeaf), FromBB,
+                              Iter);
     return true;
   }
 
@@ -354,16 +365,22 @@ bool Instrumentation::instrumentOneTarget(
   // paths that reach it at this point will be taken and going to the target.
   if (TargetBB->pred_size() == 1 && &FromBB != TargetBB &&
       !TargetBB->isEntryPoint()) {
-    insertInstructions(CounterInstrs, *TargetBB, TargetBB->begin());
+    insertInstructions(createInstrumentationSnippet(
+                           BC, IsLeaf, ScratchCandidates,
+                           instructionsAfter(*TargetBB, TargetBB->begin())),
+                       *TargetBB, TargetBB->begin());
     return true;
   }
   if (FromBB.succ_size() == 1 && &FromBB != TargetBB) {
-    Iter = insertInstructions(CounterInstrs, FromBB, Iter);
+    Iter = insertInstructions(
+        createInstrumentationSnippet(BC, IsLeaf, ScratchCandidates,
+                                     instructionsAfter(FromBB, Iter)),
+        FromBB, Iter);
     return true;
   }
   // Critical edge, create BB and put counter there
   SplitWorklist.emplace_back(&FromBB, TargetBB);
-  SplitInstrs.emplace_back(std::move(CounterInstrs));
+  SplitInstrs.emplace_back(createInstrumentationSnippet(BC, IsLeaf));
   return true;
 }
 
@@ -399,6 +416,9 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
   DenseSet<const BinaryBasicBlock *> BBToSkip;
   if (BC.isAArch64() && hasAArch64ExclusiveMemop(Function, BBToSkip))
     return;
+
+  const auto ScratchCandidates =
+      BC.MIB->getInstrumentationScratchCandidates(Function);
 
   SplitWorklistTy SplitWorklist;
   SplitInstrsTy SplitInstrs;
@@ -515,7 +535,7 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
           instrumentOneTarget(SplitWorklist, SplitInstrs, I, Function, BB,
                               FromOffset, *TargetFunc, TargetBB, ToOffset,
                               IsLeafFunction, IsInvokeBlock, FuncDesc,
-                              BBToID[&BB]);
+                              BBToID[&BB], ScratchCandidates);
         }
         continue;
       }
@@ -533,7 +553,7 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
         instrumentOneTarget(SplitWorklist, SplitInstrs, I, Function, BB,
                             FromOffset, *TargetFunc, TargetBB, ToOffset,
                             IsLeafFunction, IsInvokeBlock, FuncDesc,
-                            BBToID[&BB], BBToID[TargetBB]);
+                            BBToID[&BB], ScratchCandidates, BBToID[TargetBB]);
         continue;
       }
 
@@ -552,7 +572,7 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
           instrumentOneTarget(
               SplitWorklist, SplitInstrs, I, Function, BB, FromOffset, Function,
               &*Succ, Succ->getInputOffset(), IsLeafFunction, IsInvokeBlock,
-              FuncDesc, BBToID[&BB], BBToID[&*Succ]);
+              FuncDesc, BBToID[&BB], ScratchCandidates, BBToID[&*Succ]);
         }
         continue;
       }
@@ -596,7 +616,7 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
       instrumentOneTarget(SplitWorklist, SplitInstrs, I, Function, BB,
                           FromOffset, Function, FTBB, FTBB->getInputOffset(),
                           IsLeafFunction, IsInvokeBlock, FuncDesc, BBToID[&BB],
-                          BBToID[FTBB]);
+                          ScratchCandidates, BBToID[FTBB]);
     }
   } // End of BBs loop
 
@@ -607,7 +627,7 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
       auto STIt = STOutSet.find(&BB);
       if (STIt == STOutSet.end() || STIt->second.empty())
         instrumentLeafNode(BB, BB.begin(), IsLeafFunction, *FuncDesc,
-                           BBToID[&BB]);
+                           BBToID[&BB], ScratchCandidates);
     }
   }
 

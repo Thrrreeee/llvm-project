@@ -308,10 +308,9 @@ class RISCVMCPlusBuilder : public MCPlusBuilder {
   }
 
   bool replaceJumpTableSymbol(MCInst &Inst, const MCSymbol *OldTarget,
-                              const MCSymbol *NewTarget,
-                              MCContext *Ctx) const {
-    for (unsigned OpIndex = 0;
-         OpIndex < MCPlus::getNumPrimeOperands(Inst); ++OpIndex) {
+                              const MCSymbol *NewTarget, MCContext *Ctx) const {
+    for (unsigned OpIndex = 0; OpIndex < MCPlus::getNumPrimeOperands(Inst);
+         ++OpIndex) {
       MCOperand &Operand = Inst.getOperand(OpIndex);
       if (!Operand.isExpr())
         continue;
@@ -711,9 +710,10 @@ public:
     return IndirectBranchType::POSSIBLE_JUMP_TABLE;
   }
 
-  bool replaceJumpTableReference(
-      MutableArrayRef<MCInst> InstrWindow, const MCSymbol *OldTarget,
-      const MCSymbol *NewTarget, MCContext *Ctx) const override {
+  bool replaceJumpTableReference(MutableArrayRef<MCInst> InstrWindow,
+                                 const MCSymbol *OldTarget,
+                                 const MCSymbol *NewTarget,
+                                 MCContext *Ctx) const override {
     for (MCInst &Inst : llvm::reverse(InstrWindow)) {
       switch (Inst.getOpcode()) {
       default:
@@ -1447,30 +1447,223 @@ public:
     return Result;
   }
 
+  SmallVector<MCPhysReg, 16> getInstrumentationScratchCandidates(
+      const BinaryFunction &Function) const override {
+    // Prefer the compressed GPR subset, followed by the other caller-saved
+    // integer registers. In particular, never use ra, sp, gp, tp or s0-s11.
+    SmallVector<MCPhysReg, 16> Candidates = {
+        RISCV::X10, RISCV::X11, RISCV::X12, RISCV::X13, RISCV::X14,
+        RISCV::X15, RISCV::X16, RISCV::X17, RISCV::X5,  RISCV::X6,
+        RISCV::X7,  RISCV::X28, RISCV::X29, RISCV::X30, RISCV::X31};
+    auto Exclude = [&](unsigned DwarfReg) {
+      llvm::erase_if(Candidates, [&](MCPhysReg Reg) {
+        return RegInfo->getDwarfRegNum(Reg, false) == int(DwarfReg);
+      });
+    };
+    auto CheckCFI = [&](const MCCFIInstruction &CFI) {
+      switch (CFI.getOperation()) {
+      case MCCFIInstruction::OpRegister:
+        Exclude(CFI.getRegister2());
+        [[fallthrough]];
+      case MCCFIInstruction::OpDefCfa:
+      case MCCFIInstruction::OpDefCfaRegister:
+      case MCCFIInstruction::OpOffset:
+      case MCCFIInstruction::OpRelOffset:
+      case MCCFIInstruction::OpValOffset:
+      case MCCFIInstruction::OpRestore:
+      case MCCFIInstruction::OpUndefined:
+      case MCCFIInstruction::OpSameValue:
+        Exclude(CFI.getRegister());
+        return true;
+      case MCCFIInstruction::OpRememberState:
+      case MCCFIInstruction::OpRestoreState:
+      case MCCFIInstruction::OpDefCfaOffset:
+      case MCCFIInstruction::OpAdjustCfaOffset:
+      case MCCFIInstruction::OpGnuArgsSize:
+      case MCCFIInstruction::OpLabel:
+        return true;
+      default:
+        // Opaque escapes and unrecognized rules may expose any register.
+        return false;
+      }
+    };
+    // Even a rule active elsewhere in the function excludes its registers.
+    // This deliberately avoids maintaining unwind state at every insertion.
+    for (const MCCFIInstruction &CFI : Function.cie())
+      if (!CheckCFI(CFI))
+        return {};
+    for (const MCCFIInstruction &CFI : Function.getFDEProgram())
+      if (!CheckCFI(CFI))
+        return {};
+    return Candidates;
+  }
+
+  SmallVector<MCPhysReg, 2> getDeadInstrumentationScratchRegs(
+      ArrayRef<MCInst> Instructions,
+      ArrayRef<MCPhysReg> Candidates) const override {
+    if (Candidates.empty())
+      return {};
+    uint32_t Pending = (1U << Candidates.size()) - 1;
+    uint32_t Dead = 0;
+    auto RegBit = [&](MCPhysReg Reg) -> uint32_t {
+      for (unsigned I = 0; I < Candidates.size(); ++I)
+        if (Candidates[I] == Reg)
+          return 1U << I;
+      return 0;
+    };
+    for (const MCInst &Inst : Instructions.take_front(32)) {
+      if (isCFI(Inst))
+        continue; // All CIE/FDE rules were checked above.
+      if (isCall(Inst) || isBranch(Inst) || isPseudo(Inst))
+        break;
+      // Explicit whitelist: calls (including implicit inputs), control flow,
+      // CSR/system instructions, atomics and unknown extensions are barriers.
+      switch (Inst.getOpcode()) {
+      default:
+        goto Done;
+      case RISCV::LUI:
+      case RISCV::AUIPC:
+      case RISCV::ADDI:
+      case RISCV::ADDIW:
+      case RISCV::SLTI:
+      case RISCV::SLTIU:
+      case RISCV::XORI:
+      case RISCV::ORI:
+      case RISCV::ANDI:
+      case RISCV::SLLI:
+      case RISCV::SRLI:
+      case RISCV::SRAI:
+      case RISCV::SLLIW:
+      case RISCV::SRLIW:
+      case RISCV::SRAIW:
+      case RISCV::ADD:
+      case RISCV::SUB:
+      case RISCV::SLL:
+      case RISCV::SLT:
+      case RISCV::SLTU:
+      case RISCV::XOR:
+      case RISCV::SRL:
+      case RISCV::SRA:
+      case RISCV::OR:
+      case RISCV::AND:
+      case RISCV::ADDW:
+      case RISCV::SUBW:
+      case RISCV::SLLW:
+      case RISCV::SRLW:
+      case RISCV::SRAW:
+      case RISCV::LB:
+      case RISCV::LBU:
+      case RISCV::LH:
+      case RISCV::LHU:
+      case RISCV::LW:
+      case RISCV::LWU:
+      case RISCV::LD:
+      case RISCV::SB:
+      case RISCV::SH:
+      case RISCV::SW:
+      case RISCV::SD:
+      case RISCV::C_NOP:
+      case RISCV::C_LI:
+      case RISCV::C_LUI:
+      case RISCV::C_MV:
+      case RISCV::C_ADDI:
+      case RISCV::C_ADDIW:
+      case RISCV::C_ADDI16SP:
+      case RISCV::C_ADDI4SPN:
+      case RISCV::C_ADD:
+      case RISCV::C_ADDW:
+      case RISCV::C_SUB:
+      case RISCV::C_SUBW:
+      case RISCV::C_AND:
+      case RISCV::C_OR:
+      case RISCV::C_XOR:
+      case RISCV::C_ANDI:
+      case RISCV::C_SLLI:
+      case RISCV::C_SRLI:
+      case RISCV::C_SRAI:
+      case RISCV::C_LW:
+      case RISCV::C_LWSP:
+      case RISCV::C_LD:
+      case RISCV::C_LDSP:
+      case RISCV::C_SW:
+      case RISCV::C_SWSP:
+      case RISCV::C_SD:
+      case RISCV::C_SDSP:
+        break;
+      }
+      const MCInstrDesc &Desc = Info->get(Inst.getOpcode());
+      if (MCPlus::getNumPrimeOperands(Inst) != Desc.getNumOperands())
+        break;
+      // Tied read/modify/write operands (e.g. C.ADDI) are uses before defs.
+      uint32_t Uses = 0, Defs = 0;
+      for (const MCOperand &Op : useOperands(Inst))
+        if (Op.isReg())
+          Uses |= RegBit(Op.getReg());
+      for (MCPhysReg Reg : Desc.implicit_uses())
+        Uses |= RegBit(Reg);
+      for (const MCOperand &Op : defOperands(Inst))
+        if (Op.isReg())
+          Defs |= RegBit(Op.getReg());
+      for (MCPhysReg Reg : Desc.implicit_defs())
+        Defs |= RegBit(Reg);
+      Pending &= ~Uses;
+      Dead |= Pending & Defs;
+      Pending &= ~Defs;
+      if (!Pending || llvm::popcount(Dead) >= 2)
+        break;
+    }
+  Done:
+    SmallVector<MCPhysReg, 2> Result;
+    for (unsigned I = 0; I < Candidates.size() && Result.size() < 2; ++I)
+      if (Dead & (1U << I))
+        Result.push_back(Candidates[I]);
+    return Result;
+  }
+
   InstructionListType createInstrIncMemory(const MCSymbol *Target,
                                            MCContext *Ctx, bool IsLeaf,
                                            unsigned CodePointerSize) override {
-    // We need 2 scratch registers: one for the target address (x10), and one
-    // for the increment value (x11).
-    // addi sp, sp, -16
-    // sd x10, 0(sp)
-    // sd x11, 8(sp)
-    // la x10, target         # 1: auipc x10, %pcrel_hi(target)
-    //                        # addi x10, x10, %pcrel_lo(1b)
-    // li x11, 1              # addi x11, zero, 1
-    // amoadd.d zero, x10, x11
-    // ld x10, 0(sp)
-    // ld x11, 8(sp)
-    // addi sp, sp, 16
+    return createInstrIncMemoryWithScratch(Target, Ctx, IsLeaf, CodePointerSize,
+                                           {});
+  }
+
+  InstructionListType
+  createInstrIncMemoryWithScratch(const MCSymbol *Target, MCContext *Ctx,
+                                  bool IsLeaf, unsigned CodePointerSize,
+                                  ArrayRef<MCPhysReg> DeadRegs) override {
+    const MCPhysReg AddrReg = DeadRegs.empty() ? RISCV::X10 : DeadRegs[0];
+    const MCPhysReg ValueReg = DeadRegs.size() > 1     ? DeadRegs[1]
+                               : AddrReg == RISCV::X11 ? RISCV::X10
+                                                       : RISCV::X11;
+    SmallVector<unsigned, 2> Spilled;
+    if (DeadRegs.empty())
+      Spilled.push_back(AddrReg);
+    if (DeadRegs.size() < 2)
+      Spilled.push_back(ValueReg);
 
     InstructionListType Insts;
-    spillRegs(Insts, {RISCV::X10, RISCV::X11});
-    InstructionListType Addr = materializeAddress(Target, Ctx, RISCV::X10);
+    // One live scratch register still needs a 16-byte aligned frame.
+    if (!Spilled.empty()) {
+      Insts.emplace_back();
+      createStackPointerIncrement(Insts.back(), 16);
+      for (unsigned I = 0; I < Spilled.size(); ++I) {
+        Insts.emplace_back();
+        storeReg(Insts.back(), Spilled[I], RISCV::X2, I * regSize());
+      }
+    }
+    InstructionListType Addr = materializeAddress(Target, Ctx, AddrReg);
     Insts.insert(Insts.end(), Addr.begin(), Addr.end());
     InstructionListType IncInsts =
-        createIncMemory(RISCV::X10, RISCV::X11, RISCV::X0);
+        createIncMemory(AddrReg, ValueReg, RISCV::X0);
     Insts.insert(Insts.end(), IncInsts.begin(), IncInsts.end());
-    reloadRegs(Insts, {RISCV::X10, RISCV::X11});
+    if (!Spilled.empty()) {
+      for (unsigned I = 0; I < Spilled.size(); ++I) {
+        Insts.emplace_back();
+        loadReg(Insts.back(), Spilled[I], RISCV::X2, I * regSize());
+      }
+      Insts.emplace_back();
+      createStackPointerDecrement(Insts.back(), 16);
+    }
 
     // MC streamers do not perform the compression done by the assembly parser.
     // Compress only these newly generated instructions with fixed operands;
@@ -1644,7 +1837,7 @@ public:
                            .addReg(RISCV::X5)
                            .addImm((Imm >> 12) & 0xFFFFF));
     Insts.emplace_back(
-        MCInstBuilder(RISCV::LUI).addReg(RISCV::X6).addImm((Imm)&0xFFF));
+        MCInstBuilder(RISCV::LUI).addReg(RISCV::X6).addImm((Imm) & 0xFFF));
     Insts.emplace_back(MCInstBuilder(RISCV::SRLI)
                            .addReg(RISCV::X6)
                            .addReg(RISCV::X6)

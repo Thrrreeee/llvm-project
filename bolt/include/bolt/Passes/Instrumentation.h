@@ -64,8 +64,10 @@ private:
   void createLeafNodeDescription(FunctionDescription &FuncDesc, uint32_t Node);
 
   /// Create the sequence of instructions to increment a counter
-  InstructionListType createInstrumentationSnippet(BinaryContext &BC,
-                                                   bool IsLeaf);
+  InstructionListType
+  createInstrumentationSnippet(BinaryContext &BC, bool IsLeaf,
+                               ArrayRef<MCPhysReg> ScratchCandidates = {},
+                               ArrayRef<MCInst> FollowingInstructions = {});
 
   // Critical edges worklist
   // This worklist keeps track of CFG edges <From-To> that needs to be split.
@@ -81,19 +83,17 @@ private:
   /// if this is a local branch and null if it is a call. Return true if the
   /// location was instrumented with an explicit counter or false if it just
   /// created the description, but no explicit counters were necessary.
-  bool instrumentOneTarget(SplitWorklistTy &SplitWorklist,
-                           SplitInstrsTy &SplitInstrs,
-                           BinaryBasicBlock::iterator &Iter,
-                           BinaryFunction &FromFunction,
-                           BinaryBasicBlock &FromBB, uint32_t From,
-                           BinaryFunction &ToFunc, BinaryBasicBlock *TargetBB,
-                           uint32_t ToOffset, bool IsLeaf, bool IsInvoke,
-                           FunctionDescription *FuncDesc, uint32_t FromNodeID,
-                           uint32_t ToNodeID = 0);
+  bool instrumentOneTarget(
+      SplitWorklistTy &SplitWorklist, SplitInstrsTy &SplitInstrs,
+      BinaryBasicBlock::iterator &Iter, BinaryFunction &FromFunction,
+      BinaryBasicBlock &FromBB, uint32_t From, BinaryFunction &ToFunc,
+      BinaryBasicBlock *TargetBB, uint32_t ToOffset, bool IsLeaf, bool IsInvoke,
+      FunctionDescription *FuncDesc, uint32_t FromNodeID,
+      ArrayRef<MCPhysReg> ScratchCandidates, uint32_t ToNodeID = 0);
 
   void instrumentLeafNode(BinaryBasicBlock &BB, BinaryBasicBlock::iterator Iter,
                           bool IsLeaf, FunctionDescription &FuncDesc,
-                          uint32_t Node);
+                          uint32_t Node, ArrayRef<MCPhysReg> ScratchCandidates);
 
   void instrumentIndirectTarget(BinaryBasicBlock &BB,
                                 BinaryBasicBlock::iterator &Iter,

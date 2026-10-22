@@ -974,6 +974,33 @@ TEST_P(MCPlusBuilderTester, AArch64_isCleanReg) {
 INSTANTIATE_TEST_SUITE_P(RISCV, MCPlusBuilderTester,
                          ::testing::Values(Triple::riscv64));
 
+TEST_P(MCPlusBuilderTester, RISCV_InstrumentationScratchCFI) {
+  if (GetParam() != Triple::riscv64)
+    GTEST_SKIP();
+  BinaryFunction *BF = BC->createInjectedBinaryFunction("CFIScratch", true);
+  std::unique_ptr<BinaryBasicBlock> BB = BF->createBasicBlock();
+  auto Candidates = BC->MIB->getInstrumentationScratchCandidates(*BF);
+  EXPECT_EQ(Candidates.size(), 15U);
+  EXPECT_TRUE(llvm::is_contained(Candidates, RISCV::X10));
+  EXPECT_FALSE(llvm::is_contained(Candidates, RISCV::X9));
+
+  BF->addCFIInstruction(BB.get(), BB->end(),
+                        MCCFIInstruction::createRegister(nullptr, 9, 10));
+  BF->addCFIInstruction(BB.get(), BB->end(),
+                        MCCFIInstruction::createOffset(nullptr, 11, -8));
+  ASSERT_EQ(BF->getFDEProgram().size(), 2U);
+  Candidates = BC->MIB->getInstrumentationScratchCandidates(*BF);
+  EXPECT_FALSE(llvm::is_contained(Candidates, RISCV::X10));
+  EXPECT_FALSE(llvm::is_contained(Candidates, RISCV::X11));
+  EXPECT_TRUE(llvm::is_contained(Candidates, RISCV::X12));
+
+  // An unknown rule cannot be assumed to leave the remaining candidates free.
+  BF->addCFIInstruction(BB.get(), BB->end(),
+                        MCCFIInstruction::createEscape(
+                            nullptr, StringRef("\x16\x12\x01\x30", 4)));
+  EXPECT_TRUE(BC->MIB->getInstrumentationScratchCandidates(*BF).empty());
+}
+
 TEST_P(MCPlusBuilderTester, RISCV_CreateBranchRelocations) {
   if (GetParam() != Triple::riscv64)
     GTEST_SKIP();

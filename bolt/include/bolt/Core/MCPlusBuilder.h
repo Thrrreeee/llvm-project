@@ -570,6 +570,29 @@ public:
     return InstructionListType();
   }
 
+  /// Registers that may be used as instrumentation scratch if a local
+  /// use-before-def scan proves them dead. Exclude unwind-visible registers.
+  virtual SmallVector<MCPhysReg, 16>
+  getInstrumentationScratchCandidates(const BinaryFunction &Function) const {
+    return {};
+  }
+
+  /// Prove at most two scratch registers dead at the start of Instructions.
+  /// Instructions must start at the actual insertion point and stay in one BB.
+  virtual SmallVector<MCPhysReg, 2>
+  getDeadInstrumentationScratchRegs(ArrayRef<MCInst> Instructions,
+                                    ArrayRef<MCPhysReg> Candidates) const {
+    return {};
+  }
+
+  /// Targets without a scratch-aware implementation retain their old snippet.
+  virtual InstructionListType
+  createInstrIncMemoryWithScratch(const MCSymbol *Target, MCContext *Ctx,
+                                  bool IsLeaf, unsigned CodePointerSize,
+                                  ArrayRef<MCPhysReg> DeadRegs) {
+    return createInstrIncMemory(Target, Ctx, IsLeaf, CodePointerSize);
+  }
+
   /// Return a register number that is guaranteed to not match with
   /// any real register on the underlying architecture.
   MCPhysReg getNoRegister() const { return MCRegister::NoRegister; }
@@ -1172,9 +1195,10 @@ public:
   /// Retarget the reference used by the jump-table dispatch at the end of
   /// \p InstrWindow from \p OldTarget to \p NewTarget. Targets that need
   /// architecture-specific multi-instruction matching can override this hook.
-  virtual bool replaceJumpTableReference(
-      MutableArrayRef<MCInst> InstrWindow, const MCSymbol *OldTarget,
-      const MCSymbol *NewTarget, MCContext *Ctx) const {
+  virtual bool replaceJumpTableReference(MutableArrayRef<MCInst> InstrWindow,
+                                         const MCSymbol *OldTarget,
+                                         const MCSymbol *NewTarget,
+                                         MCContext *Ctx) const {
     return false;
   }
 

@@ -26,7 +26,7 @@
 # RUN: llvm-bolt %t.exe --data=%t.fdata --reorder-blocks=cache -o %t.bolt
 # RUN: %t.bolt
 
-# COUNTER: amoadd.d zero, a1, (a0)
+# COUNTER: amoadd.d zero, {{[a-z0-9]+}}, ({{[a-z0-9]+}})
 # PROFILE: ordinary_amo 0 0 1{{$}}
 
 # LOG-DAG: BOLT-INSTRUMENTER: skipping function atomic_w containing a RISC-V LR/SC instruction

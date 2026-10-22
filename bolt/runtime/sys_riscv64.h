@@ -81,9 +81,20 @@ namespace {
 uint64_t getTextBaseAddress() {
   uint64_t DynAddr;
   uint64_t StaticAddr;
-  __asm__ volatile("lla %0, __hot_end\n\t"
-                   "lui %1, %%hi(__hot_end)\n\t"
-                   "addi %1, %1, %%lo(__hot_end)\n\t"
+  // JITLink writes the full link-time address into this literal. It must not
+  // receive a dynamic relocation: subtracting it from the same local label's
+  // runtime PC gives the load bias, even when the image is above 2 GiB.
+  __asm__ volatile(".option push\n\t"
+                   ".option norelax\n\t"
+                   "j .Lbolt_pc%=\n\t"
+                   ".p2align 3\n\t"
+                   ".Lbolt_static%=:\n\t"
+                   ".dword .Lbolt_pc%=\n\t"
+                   ".Lbolt_pc%=:\n\t"
+                   "auipc %0, 0\n\t"
+                   "lla %1, .Lbolt_static%=\n\t"
+                   "ld %1, 0(%1)\n\t"
+                   ".option pop\n\t"
                    : "=r"(DynAddr), "=r"(StaticAddr));
   return DynAddr - StaticAddr;
 }

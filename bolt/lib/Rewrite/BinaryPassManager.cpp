@@ -396,6 +396,10 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   if (BC.isRISCV()) {
     Manager.registerPass(
         std::make_unique<FixRISCVCallsPass>(PrintFixRISCVCalls));
+    // Internal calls make the CFG unsuitable for instrumentation and branch
+    // relaxation. Classify them before far-data conversion can grow the body
+    // and choose which functions must keep their original addressing limits.
+    Manager.registerPass(std::make_unique<ValidateInternalCalls>(NeverPrint));
   }
 
 #ifdef RISCV_AVAILABLE
@@ -415,7 +419,8 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
 
   Manager.registerPass(std::make_unique<PrintProfileQualityStats>(NeverPrint));
 
-  Manager.registerPass(std::make_unique<ValidateInternalCalls>(NeverPrint));
+  if (!BC.isRISCV())
+    Manager.registerPass(std::make_unique<ValidateInternalCalls>(NeverPrint));
 
   Manager.registerPass(std::make_unique<ValidateMemRefs>(NeverPrint));
 

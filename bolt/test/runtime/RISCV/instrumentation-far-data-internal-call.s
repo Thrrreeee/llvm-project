@@ -20,7 +20,7 @@
 # CHECK: preserving original code for 1 RISC-V functions with internal calls
 # CHECK: RISC-V far-data slots replaced 1 AUIPC references and restored 1 low operands; kept 0 LR/SC functions, 0 non-simple functions
 # CHECK: BOLT-INSTRUMENTER: Number of function descriptors: 2
-# CHECK-NOT: RISC-V far-data placement:
+# CHECK: RISC-V far-data placement: 1 functions placed before remaining emitted functions
 # PROFILE-COUNT-2: 1 main {{[0-9a-f]+}} 1 large 0 0 1{{$}}
 # PROFILE: body_callee 0 0 1{{$}}
 

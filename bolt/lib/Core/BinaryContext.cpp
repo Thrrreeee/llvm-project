@@ -1733,6 +1733,9 @@ void BinaryContext::processFixedReferences(bool EntriesComplete) {
     if (Reference.HasInteriorEntry)
       continue;
     BinaryFunction &Source = *Reference.Source;
+    if (isRISCV() && (Reference.Rel.Type == ELF::R_RISCV_CALL ||
+                      Reference.Rel.Type == ELF::R_RISCV_CALL_PLT))
+      RISCVFixedCallTargets.insert(Reference.Rel.Symbol);
     Reference.Rel.Offset +=
         Source.getAddress() - Source.getOriginSection()->getAddress();
     Source.getOriginSection()->addPendingRelocation(Reference.Rel);

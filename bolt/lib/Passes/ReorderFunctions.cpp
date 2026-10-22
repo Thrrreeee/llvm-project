@@ -845,6 +845,16 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
 
   reorder(BC, std::move(Clusters), BFs, UserFileEndIndex);
 
+  // Far-data mode can place the end of instrumented code beyond the reach of
+  // an AUIPC/JALR pair in the original text. Such a pair must keep its length
+  // and registers, so place its moved target with the other constrained code.
+  // Resolve symbols here because ICF may have folded the original target.
+  if (BC.isRISCV() && BC.KeepOriginalEHFrame)
+    for (const MCSymbol *Symbol : BC.RISCVFixedCallTargets)
+      if (BinaryFunction *BF = BC.getFunctionForSymbol(Symbol))
+        if (BC.shouldEmit(*BF))
+          BC.RISCVFarDataEarlyFunctions.insert(BF);
+
   if (!BC.RISCVFarDataEarlyFunctions.empty()) {
     BinaryFunctionListType OrderedFunctions;
     for (BinaryFunction &BF : llvm::make_second_range(BFs))

@@ -430,6 +430,9 @@ public:
   std::vector<RISCVFarDataSlot> RISCVFarDataSlots;
   bool SupportsRISCVFarDataSlots{false};
   DenseSet<const BinaryFunction *> RISCVFarDataEarlyFunctions;
+  /// Targets of complete call pairs patched in original RISC-V code. Resolve
+  /// the symbols after ICF so placement follows the surviving functions.
+  DenseSet<const MCSymbol *> RISCVFixedCallTargets;
   /// Preserve input FDEs at their original addresses when moving their PC32
   /// references to the output allocation would exceed the encoding's range.
   bool KeepOriginalEHFrame{false};

@@ -623,8 +623,15 @@ void Instrumentation::instrumentFunction(BinaryFunction &Function,
     ++Iter;
   }
 
-  // Unused now
-  FuncDesc->EdgesSet.clear();
+  // Edge deduplication is local to this function. Release the buckets instead
+  // of retaining them in the runtime summary until emission.
+  decltype(FuncDesc->EdgesSet)().swap(FuncDesc->EdgesSet);
+
+  // Inserting snippets grows each instruction vector geometrically. All local
+  // instruction iterators are dead here, so release spare capacity before
+  // instrumenting the next function.
+  for (BinaryBasicBlock &BB : Function)
+    BB.shrinkInstructionStorage();
 }
 
 Error Instrumentation::runOnFunctions(BinaryContext &BC) {

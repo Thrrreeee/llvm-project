@@ -914,6 +914,10 @@ public:
   /// Check if the block has a jump table instruction.
   bool hasJumpTable() const { return getJumpTable() != nullptr; }
 
+  /// Release spare instruction capacity without changing the instruction list.
+  /// Invalidates instruction pointers and iterators if storage is reallocated.
+  void shrinkInstructionStorage() { Instructions.shrink_to_fit(); }
+
   /// Returns the last computed hash value of the block.
   uint64_t getHash() const { return Hash; }
 

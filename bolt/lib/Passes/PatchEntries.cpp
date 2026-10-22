@@ -71,6 +71,7 @@ Error PatchEntries::runOnFunctions(BinaryContext &BC) {
   }
 
   std::vector<std::pair<BinaryFunction *, std::vector<Patch>>> EntryPatches;
+  bool HadPatchabilityFailure = false;
   for (auto &BFI : BC.getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
 
@@ -131,10 +132,35 @@ Error PatchEntries::runOnFunctions(BinaryContext &BC) {
       BC.errs() << "BOLT-WARNING: failed to patch entries in " << Function
                 << ". The function will not be optimized\n";
       Function.setIgnored();
+      HadPatchabilityFailure = true;
       continue;
     }
 
     EntryPatches.emplace_back(&Function, std::move(PendingPatches));
+  }
+
+  if (HadPatchabilityFailure && BC.isRISCV() && BC.KeepOriginalEHFrame) {
+    // A failed patch can retain a previously movable callee, including via
+    // transitive external-reference scans. Refresh incoming-call constraints
+    // after that closure; the earlier far-data scan could not see these
+    // targets. Avoid another full instruction scan when no patch failed.
+    for (auto &[Address, Caller] : BC.getBinaryFunctions()) {
+      if (!BC.shouldEmit(Caller) || !Caller.hasCFG())
+        continue;
+      for (const BinaryBasicBlock &BB : Caller)
+        for (const MCInst &Inst : BB) {
+          if (!BC.MIB->isCall(Inst) || BC.MIB->isIndirectCall(Inst))
+            continue;
+          const BinaryFunction *Target =
+              BC.getFunctionForSymbol(BC.MIB->getTargetSymbol(Inst));
+          if (!Target || BC.shouldEmit(*Target))
+            continue;
+          auto [It, Inserted] = BC.RISCVFixedCalleeCallers.try_emplace(
+              Caller.getSymbol(), Target->getAddress());
+          if (!Inserted)
+            It->second = std::min(It->second, Target->getAddress());
+        }
+    }
   }
 
   // A function that cannot be patched is retained. Scanning its references
@@ -161,6 +187,12 @@ Error PatchEntries::runOnFunctions(BinaryContext &BC) {
       BinaryFunction *PatchFunction = BC.createInstructionPatch(
           Patch.Address, Instructions,
           NameResolver::append(Patch.Symbol->getName(), ".org.0"));
+      if (BC.isRISCV() && BC.KeepOriginalEHFrame) {
+        auto [It, Inserted] =
+            BC.RISCVEntryPatchTargets.try_emplace(Patch.Symbol, Patch.Address);
+        if (!Inserted)
+          It->second = std::min(It->second, Patch.Address);
+      }
       if (BC.usesBTI())
         BC.MIB->applyBTIFixupToSymbol(BC, Patch.Symbol,
                                       *(Instructions.end() - 1));

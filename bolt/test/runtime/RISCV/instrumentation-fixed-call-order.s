@@ -85,7 +85,8 @@ preserved:
   .type padding,@function
 padding:
   .cfi_startproc
-  .rept 1024
+  ## Keep this ordinary function below the entry-patching threshold.
+  .rept 16
   addi t0, t0, 1
   .endr
   ret

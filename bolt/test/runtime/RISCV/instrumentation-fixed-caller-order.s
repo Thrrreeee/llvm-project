@@ -24,7 +24,7 @@
 
 # CHECK: kept 1 LR/SC functions
 # CHECK: RISC-V far-data placement
-# CHECK: RISC-V fixed-callee placement: 3 callers ordered by original callee address
+# CHECK: RISC-V fixed-call placement: 3 functions ordered by call-range deadlines
 # CHECK: RISC-V far-data placement changes the requested function order
 # OFF-NOT: RISC-V far-data placement
 # PROFILE-DAG: 1 direct_caller {{[0-9a-f]+}} 1 fixed_leaf 0 0 1{{$}}
@@ -118,7 +118,8 @@ atomic:
   .type padding,@function
 padding:
   .cfi_startproc
-  .rept 1024
+  ## Keep this ordinary function below the entry-patching threshold.
+  .rept 16
   addi t0, t0, 1
   .endr
   ret

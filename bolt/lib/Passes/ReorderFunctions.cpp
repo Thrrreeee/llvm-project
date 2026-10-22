@@ -20,6 +20,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Utils/CodeLayout.h"
 #include <fstream>
 
@@ -855,16 +856,26 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
         if (BC.shouldEmit(*BF))
           BC.RISCVFarDataEarlyFunctions.insert(BF);
 
-  DenseMap<const BinaryFunction *, uint64_t> FixedCalleeCallers;
-  for (const auto &[Symbol, Address] : BC.RISCVFixedCalleeCallers)
+  DenseMap<const BinaryFunction *, uint64_t> FixedCallDeadlines;
+  auto AddDeadline = [&](const MCSymbol *Symbol, uint64_t Address,
+                         uint64_t Allowance) {
     if (BinaryFunction *BF = BC.getFunctionForSymbol(Symbol))
       if (BC.shouldEmit(*BF)) {
-        auto [It, Inserted] = FixedCalleeCallers.try_emplace(BF, Address);
+        const uint64_t Deadline = SaturatingAdd(Address, Allowance);
+        auto [It, Inserted] = FixedCallDeadlines.try_emplace(BF, Deadline);
         if (!Inserted)
-          It->second = std::min(It->second, Address);
+          It->second = std::min(It->second, Deadline);
       }
+  };
+  // AUIPC/JALR represents [-0x80000800, 0x7ffff7ff]. A moved caller of
+  // fixed code has a backward bound; a moved entry-patch target has a forward
+  // bound. Keep the two different inclusive limits when combining them.
+  for (const auto &[Symbol, Address] : BC.RISCVFixedCalleeCallers)
+    AddDeadline(Symbol, Address, 0x80000800);
+  for (const auto &[Symbol, Address] : BC.RISCVEntryPatchTargets)
+    AddDeadline(Symbol, Address, 0x7ffff7ff);
 
-  if (!BC.RISCVFarDataEarlyFunctions.empty() || !FixedCalleeCallers.empty()) {
+  if (!BC.RISCVFarDataEarlyFunctions.empty() || !FixedCallDeadlines.empty()) {
     BinaryFunctionListType OrderedFunctions;
     for (BinaryFunction &BF : llvm::make_second_range(BFs))
       if (BC.shouldEmit(BF))
@@ -873,14 +884,14 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
     auto IsEarly = [&BC](const BinaryFunction *BF) {
       return BC.RISCVFarDataEarlyFunctions.contains(BF);
     };
-    auto IsFixedCaller = [&](const BinaryFunction *BF) {
-      return FixedCalleeCallers.contains(BF);
+    auto HasFixedCall = [&](const BinaryFunction *BF) {
+      return FixedCallDeadlines.contains(BF);
     };
     auto Priority = [&](const BinaryFunction *BF) {
       if (IsEarly(BF))
         return std::make_pair(0, uint64_t(0));
-      auto It = FixedCalleeCallers.find(BF);
-      return It != FixedCalleeCallers.end() ? std::make_pair(1, It->second)
+      auto It = FixedCallDeadlines.find(BF);
+      return It != FixedCallDeadlines.end() ? std::make_pair(1, It->second)
                                             : std::make_pair(2, uint64_t(0));
     };
     const bool ChangesOrder =
@@ -894,17 +905,16 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
         });
     const auto EarlyEnd = std::stable_partition(
         OrderedFunctions.begin(), OrderedFunctions.end(), IsEarly);
-    const auto CallersEnd =
-        std::stable_partition(EarlyEnd, OrderedFunctions.end(), IsFixedCaller);
-    // Do not push the original fixed-data/call-target prefix later. Within
-    // the following caller group, lower input callees have earlier backward
-    // CALL deadlines (callee address + 0x80000800). Sort those first, leaving
-    // the user order unchanged for equal bounds. Final relocation checks are
-    // still required, including for explicit split layouts.
-    std::stable_sort(EarlyEnd, CallersEnd,
+    const auto ConstrainedEnd =
+        std::stable_partition(EarlyEnd, OrderedFunctions.end(), HasFixedCall);
+    // Keep the original fixed-data/call-target prefix first, then merge both
+    // directions of fixed-code calls by their tightest placement deadline.
+    // Preserve user order for equal bounds. Final relocation checks remain
+    // necessary, including for explicit split layouts and secondary entries.
+    std::stable_sort(EarlyEnd, ConstrainedEnd,
                      [&](const BinaryFunction *A, const BinaryFunction *B) {
-                       return FixedCalleeCallers.lookup(A) <
-                              FixedCalleeCallers.lookup(B);
+                       return FixedCallDeadlines.lookup(A) <
+                              FixedCallDeadlines.lookup(B);
                      });
     uint32_t Index = 0;
     for (BinaryFunction *BF : OrderedFunctions) {
@@ -914,10 +924,10 @@ Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
     BC.outs() << "BOLT-INFO: RISC-V far-data placement: "
               << std::distance(OrderedFunctions.begin(), EarlyEnd)
               << " functions placed before remaining emitted functions\n";
-    if (CallersEnd != EarlyEnd)
-      BC.outs() << "BOLT-INFO: RISC-V fixed-callee placement: "
-                << std::distance(EarlyEnd, CallersEnd)
-                << " callers ordered by original callee address after the "
+    if (ConstrainedEnd != EarlyEnd)
+      BC.outs() << "BOLT-INFO: RISC-V fixed-call placement: "
+                << std::distance(EarlyEnd, ConstrainedEnd)
+                << " functions ordered by call-range deadlines after the "
                    "fixed-data and call-target prefix\n";
     if (ChangesUserOrder)
       BC.errs() << "BOLT-WARNING: RISC-V far-data placement changes the "

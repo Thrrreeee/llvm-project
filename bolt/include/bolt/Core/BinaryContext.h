@@ -436,6 +436,8 @@ public:
   /// Minimum original callee address for each caller of fixed RISC-V code.
   /// Keep caller symbols so ICF can redirect their placement constraints.
   DenseMap<const MCSymbol *, uint64_t> RISCVFixedCalleeCallers;
+  /// Minimum original source address of an entry patch to each moved symbol.
+  DenseMap<const MCSymbol *, uint64_t> RISCVEntryPatchTargets;
   /// Preserve input FDEs at their original addresses when moving their PC32
   /// references to the output allocation would exceed the encoding's range.
   bool KeepOriginalEHFrame{false};

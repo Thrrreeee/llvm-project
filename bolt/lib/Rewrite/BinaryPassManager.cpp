@@ -60,6 +60,9 @@ extern cl::opt<bool> PrintDynoStats;
 extern cl::opt<bool> DumpDotAll;
 extern bool shouldDumpDot(const bolt::BinaryFunction &Function);
 extern cl::opt<std::string> AsmDump;
+#ifdef RISCV_AVAILABLE
+extern cl::opt<bool> RISCVInstrumentationFarData;
+#endif
 extern cl::opt<bolt::PLTCall::OptType> PLT;
 extern cl::opt<bolt::IdenticalCodeFolding::ICFLevel, false,
                llvm::bolt::DeprecatedICFNumericOptionParser>
@@ -373,6 +376,10 @@ Error BinaryFunctionPassManager::runPasses() {
 
 Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   BinaryFunctionPassManager Manager(BC);
+  bool EarlyRISCVEntryPatches = false;
+#ifdef RISCV_AVAILABLE
+  EarlyRISCVEntryPatches = BC.isRISCV() && opts::RISCVInstrumentationFarData;
+#endif
 
   if (BC.isAArch64())
     Manager.registerPass(
@@ -495,6 +502,12 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   // fix branches consistency internally.
   Manager.registerPass(std::make_unique<FixupBranches>(PrintAfterBranchFixup));
 
+  // Entry patches are fixed-address callers too. In far-data mode, complete
+  // their patchability checks and reference closure before choosing the order
+  // of their moved targets. The subsequent passes preserve original entries.
+  if (BC.HasRelocations && EarlyRISCVEntryPatches)
+    Manager.registerPass(std::make_unique<PatchEntries>());
+
   // This pass should come close to last since it uses the estimated hot
   // size of a function to determine the order.  It should definitely
   // also happen after any changes to the call graph are made, e.g. inlining.
@@ -547,7 +560,7 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   Manager.registerPass(std::make_unique<ReorderData>());
 
   // Patch original function entries
-  if (BC.HasRelocations)
+  if (BC.HasRelocations && !EarlyRISCVEntryPatches)
     Manager.registerPass(std::make_unique<PatchEntries>());
 
   // Assign each function an output section.

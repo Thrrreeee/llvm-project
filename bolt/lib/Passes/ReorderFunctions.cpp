@@ -280,6 +280,34 @@ Error ReorderFunctions::readFunctionOrderFile(
   return Error::success();
 }
 
+/// Resolve an exact order-file name without expanding local or LTO suffixes.
+/// A disengaged optional means the name was not found. A null function means
+/// an exact name exists but does not identify an unambiguous function.
+static std::optional<BinaryFunction *>
+resolveExactFunctionOrderName(BinaryContext &BC, StringRef Name) {
+  const BinaryData *BD = BC.getBinaryDataByName(Name);
+  BinaryFunction *DataFunction =
+      BD ? BC.getFunctionForSymbol(BD->getSymbol()) : nullptr;
+  const MCSymbol *Symbol = BC.Ctx->lookupSymbol(Name);
+  BinaryFunction *SymbolFunction =
+      Symbol ? BC.getFunctionForSymbol(Symbol) : nullptr;
+
+  if (!BD && !SymbolFunction)
+    return std::nullopt;
+  if (DataFunction && SymbolFunction && DataFunction != SymbolFunction)
+    return nullptr;
+  if (DataFunction)
+    return DataFunction;
+
+  // FDE-created functions can share BinaryData with an earlier local marker
+  // whose primary symbol is not mapped to a function. Keep the exact function
+  // symbol's identity, and require the same entry address when data exists.
+  if (SymbolFunction &&
+      (!BD || BD->getAddress() == SymbolFunction->getAddress()))
+    return SymbolFunction;
+  return nullptr;
+}
+
 Expected<uint32_t> ReorderFunctions::assignFunctionOrder(
     BinaryContext &BC, std::map<uint64_t, BinaryFunction> &BFs,
     uint32_t StartIndex, DenseSet<const BinaryFunction *> *OrderedFuncs) {
@@ -297,17 +325,19 @@ Expected<uint32_t> ReorderFunctions::assignFunctionOrder(
     return std::move(E);
 
   for (const std::string &Function : FunctionNames) {
-    std::vector<uint64_t> FuncAddrs;
+    std::vector<BinaryFunction *> Functions;
 
-    BinaryData *BD = BC.getBinaryDataByName(Function);
-    if (!BD) {
+    if (std::optional<BinaryFunction *> BF =
+            resolveExactFunctionOrderName(BC, Function)) {
+      Functions.push_back(*BF);
+    } else {
       // If we can't find the main symbol name, look for alternates.
       uint32_t LocalID = 1;
       while (true) {
         const std::string FuncName = Function + "/" + std::to_string(LocalID);
-        BD = BC.getBinaryDataByName(FuncName);
-        if (BD)
-          FuncAddrs.push_back(BD->getAddress());
+        if (std::optional<BinaryFunction *> BF =
+                resolveExactFunctionOrderName(BC, FuncName))
+          Functions.push_back(*BF);
         else
           break;
         LocalID++;
@@ -315,12 +345,14 @@ Expected<uint32_t> ReorderFunctions::assignFunctionOrder(
       // Strip LTO suffixes.
       if (std::optional<StringRef> CommonName = getLTOCommonName(Function))
         if (LTOCommonNameMap.contains(*CommonName))
-          llvm::append_range(FuncAddrs, LTOCommonNameMap[*CommonName]);
-    } else {
-      FuncAddrs.push_back(BD->getAddress());
+          for (uint64_t Address : LTOCommonNameMap[*CommonName]) {
+            const BinaryData *BD = BC.getBinaryDataAtAddress(Address);
+            Functions.push_back(BD ? BC.getFunctionForSymbol(BD->getSymbol())
+                                   : nullptr);
+          }
     }
 
-    if (FuncAddrs.empty()) {
+    if (Functions.empty()) {
       if (opts::Verbosity >= 1)
         BC.errs() << "BOLT-WARNING: Reorder functions: can't find function "
                   << "for " << Function << "\n";
@@ -328,11 +360,7 @@ Expected<uint32_t> ReorderFunctions::assignFunctionOrder(
       continue;
     }
 
-    for (const uint64_t FuncAddr : FuncAddrs) {
-      const BinaryData *FuncBD = BC.getBinaryDataAtAddress(FuncAddr);
-      assert(FuncBD);
-
-      BinaryFunction *BF = BC.getFunctionForSymbol(FuncBD->getSymbol());
+    for (BinaryFunction *BF : Functions) {
       if (!BF) {
         if (opts::Verbosity >= 1)
           BC.errs() << "BOLT-WARNING: Reorder functions: can't find function "
@@ -424,15 +452,14 @@ static Error reportRISCVInstrumentationLayout(BinaryContext &BC) {
     }
     SplitFunctions += BF.isSplit();
 
-    // Match assignFunctionOrder's exact-name path, including its lookup of the
-    // primary BinaryData at that address. In particular, preserve local /N
-    // suffixes instead of exporting getPrintName() or stripped ELF names.
+    // Use the same exact-name resolution as --function-order. Preserve local
+    // /N suffixes instead of exporting getPrintName() or stripped ELF names.
     StringRef Name = BF.getOneName();
-    if (const BinaryData *NamedBD = BC.getBinaryDataByName(Name)) {
-      const BinaryData *BD = BC.getBinaryDataAtAddress(NamedBD->getAddress());
+    if (std::optional<BinaryFunction *> Resolved =
+            resolveExactFunctionOrderName(BC, Name)) {
       R.OrderNameVerified =
-          BD && BC.getFunctionForSymbol(BD->getSymbol()) == &BF &&
-          !Name.empty() && !Name.contains('\n') && !Name.contains('\r');
+          *Resolved == &BF && !Name.empty() && !Name.contains('\n') &&
+          !Name.contains('\r');
     }
     AllOrderNamesVerified &= R.OrderNameVerified;
 

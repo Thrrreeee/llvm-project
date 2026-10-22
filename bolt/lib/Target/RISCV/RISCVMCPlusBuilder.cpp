@@ -341,6 +341,16 @@ public:
 
   MCPhysReg getFlagsReg() const override { return RISCV::NoRegister; }
 
+  const MCExpr *getRISCVPCRelHi20Expr(const MCInst &Inst) const override {
+    if (Inst.getOpcode() != RISCV::AUIPC ||
+        MCPlus::getNumPrimeOperands(Inst) != 2 || !Inst.getOperand(1).isExpr())
+      return nullptr;
+    const auto *Expr = dyn_cast<MCSpecifierExpr>(Inst.getOperand(1).getExpr());
+    if (!Expr || Expr->getSpecifier() != RISCV::S_PCREL_HI)
+      return nullptr;
+    return Expr->getSubExpr();
+  }
+
   bool isRISCVLRSC(const MCInst &Inst) const override {
     switch (Inst.getOpcode()) {
     case RISCV::LR_W:

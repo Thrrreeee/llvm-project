@@ -12,10 +12,14 @@
 
 #include "bolt/Passes/ReorderFunctions.h"
 #include "bolt/Passes/HFSort.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/MC/MCValue.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Transforms/Utils/CodeLayout.h"
 #include <fstream>
 
@@ -71,6 +75,18 @@ static cl::opt<std::string> GenerateFunctionOrderFile(
     cl::desc("file to dump the ordered list of functions to use for function "
              "reordering"),
     cl::cat(BoltOptCategory));
+
+static cl::opt<std::string> RISCVInstrumentationLayoutReport(
+    "riscv-instrumentation-layout-report",
+    cl::desc("write a read-only JSONL estimate of instrumented RISC-V function "
+             "sizes and fixed-data PC-relative windows"),
+    cl::Hidden, cl::cat(BoltOptCategory));
+
+static cl::opt<std::string> RISCVInstrumentationOrderFile(
+    "riscv-instrumentation-order-file",
+    cl::desc("with --riscv-instrumentation-layout-report, write a candidate "
+             "--function-order list sorted by fixed-data window deadlines"),
+    cl::Hidden, cl::cat(BoltOptCategory));
 
 static cl::opt<std::string> LinkSectionsFile(
     "generate-link-sections",
@@ -341,7 +357,282 @@ Expected<uint32_t> ReorderFunctions::assignFunctionOrder(
   return Index;
 }
 
+namespace {
+
+/// A diagnostic model, not an alternative to relocation validation. Requiring
+/// the entire function to fit every fixed-data window avoids assuming that an
+/// AUIPC retains its current offset during subsequent passes.
+struct RISCVLayoutRecord {
+  const BinaryFunction *Function;
+  uint64_t Size{0};
+  uint64_t AlignmentBudget{0};
+  uint64_t EarliestStart{0};
+  uint64_t LatestEnd{std::numeric_limits<uint64_t>::max()};
+  uint64_t FixedReferences{0};
+  uint64_t UnresolvedReferences{0};
+  uint64_t NonFixedReferences{0};
+  bool OrderNameVerified{false};
+};
+
+static Error reportRISCVInstrumentationLayout(BinaryContext &BC) {
+  if (opts::RISCVInstrumentationLayoutReport.empty()) {
+    if (!opts::RISCVInstrumentationOrderFile.empty())
+      return createFatalBOLTError("--riscv-instrumentation-order-file requires "
+                                  "--riscv-instrumentation-layout-report");
+    return Error::success();
+  }
+  if (BC.TheTriple->getArch() != Triple::riscv64 || !opts::Instrument)
+    return createFatalBOLTError(
+        "--riscv-instrumentation-layout-report requires RISC-V64 "
+        "--instrument");
+  if (opts::RISCVInstrumentationLayoutReport ==
+      opts::RISCVInstrumentationOrderFile)
+    return createFatalBOLTError("layout report and order file must differ");
+
+  // JITLink requires displacement + 0x800 to fit in signed 32 bits. Thus an
+  // AUIPC addressing T must be at a PC in [T - Forward, T + Backward]. Use an
+  // exclusive function end no greater than the latter bound (conservative).
+  constexpr uint64_t Forward = 0x7ffff7ff;
+  constexpr uint64_t Backward = 0x80000800;
+  std::vector<RISCVLayoutRecord> Records;
+  Records.reserve(BC.getBinaryFunctions().size());
+  uint64_t SplitFunctions = 0;
+  uint64_t IslandFunctions = 0;
+  bool AllOrderNamesVerified = true;
+
+  for (const auto &[Address, BF] : BC.getBinaryFunctions()) {
+    if (!BC.shouldEmit(BF))
+      continue;
+    RISCVLayoutRecord R{&BF};
+    R.Size = BF.estimateSize() + BF.estimateConstantIslandSize();
+    // Account for mandatory and optional function alignment independently.
+    // BinaryEmitter omits optional alignment when its maximum is zero.
+    R.AlignmentBudget = BF.getMinAlignment() - 1;
+    R.AlignmentBudget +=
+        opts::padFunctionBefore(BF) + opts::padFunctionAfter(BF);
+    // AlignerPass normally replaces the current function settings with the
+    // global settings. Bound both states in case alignment is preserved.
+    const uint64_t CurrentAlignmentBudget = std::min<uint64_t>(
+        BF.getMaxAlignmentBytes(), std::max<unsigned>(1, BF.getAlignment()) - 1);
+    const uint64_t FutureAlignmentBudget = std::min<uint64_t>(
+        BC.AlignFunctionsMaxBytes, std::max(1U, BC.AlignFunctions) - 1);
+    R.AlignmentBudget +=
+        std::max(CurrentAlignmentBudget, FutureAlignmentBudget);
+    if (BF.hasIslandsInfo()) {
+      ++IslandFunctions;
+      R.AlignmentBudget += BF.getConstantIslandAlignment() - 1;
+    }
+    SplitFunctions += BF.isSplit();
+
+    // Match assignFunctionOrder's exact-name path, including its lookup of the
+    // primary BinaryData at that address. In particular, preserve local /N
+    // suffixes instead of exporting getPrintName() or stripped ELF names.
+    StringRef Name = BF.getOneName();
+    if (const BinaryData *NamedBD = BC.getBinaryDataByName(Name)) {
+      const BinaryData *BD = BC.getBinaryDataAtAddress(NamedBD->getAddress());
+      R.OrderNameVerified =
+          BD && BC.getFunctionForSymbol(BD->getSymbol()) == &BF &&
+          !Name.empty() && !Name.contains('\n') && !Name.contains('\r');
+    }
+    AllOrderNamesVerified &= R.OrderNameVerified;
+
+    for (const BinaryBasicBlock &BB : BF) {
+      uint64_t BlockBudget = BB.getAlignment() > 1 ? BB.getAlignment() - 1 : 0;
+      if (BC.AlignBlocks && !BC.PreserveBlocksAlignment)
+        BlockBudget = std::max<uint64_t>(BlockBudget,
+                                        std::max(1U, BC.BlockAlignment) - 1);
+      R.AlignmentBudget += BlockBudget;
+      for (const MCInst &Inst : BB) {
+        const MCExpr *Expr = BC.MIB->getRISCVPCRelHi20Expr(Inst);
+        if (!Expr)
+          continue;
+        MCValue Value;
+        if (!Expr->evaluateAsRelocatable(Value, nullptr) || Value.getSubSym() ||
+            Value.getSpecifier() || !Value.getAddSym()) {
+          ++R.UnresolvedReferences;
+          continue;
+        }
+        const MCSymbol &Symbol = *Value.getAddSym();
+        const BinaryData *SymbolBD = BC.getBinaryDataByName(Symbol.getName());
+        if (!SymbolBD) {
+          // Includes newly created instrumentation counters and runtime data.
+          ++R.UnresolvedReferences;
+          continue;
+        }
+        const uint64_t Target = SymbolBD->getAddress() + Value.getConstant();
+        if (Target > uint64_t(INT64_MAX) - Backward) {
+          ++R.UnresolvedReferences;
+          continue;
+        }
+        // Resolve the effective address, not just the symbol: GOT references
+        // can use __BOLT_got_zero + the original GOT address.
+        ErrorOr<BinarySection &> Section = BC.getSectionForAddress(Target);
+        const BinaryData *TargetBD = BC.getBinaryDataContainingAddress(Target);
+        auto MayMove = [](const BinaryData *BD) {
+          return BD && (BD->isMoved() || BD->getRootData()->isMoved() ||
+                        BD->isJumpTable() || BD->getRootData()->isJumpTable());
+        };
+        if (!Section || !Section->isAllocatable() || Section->isText() ||
+            Section->isReordered() || MayMove(SymbolBD) || MayMove(TargetBD) ||
+            BC.forceSymbolRelocations(Symbol.getName()) ||
+            BC.getFunctionForSymbol(&Symbol) ||
+            BC.getBinaryFunctionContainingAddress(Target)) {
+          ++R.NonFixedReferences;
+          continue;
+        }
+        ++R.FixedReferences;
+        R.EarliestStart =
+            std::max(R.EarliestStart, Target > Forward ? Target - Forward : 0);
+        R.LatestEnd = std::min(R.LatestEnd, Target + Backward);
+      }
+    }
+    Records.push_back(R);
+  }
+
+  // Earliest deadline first, with input addresses breaking ties. The diagnostic
+  // never modifies function indices or the actual layout.
+  llvm::sort(Records,
+             [](const RISCVLayoutRecord &A, const RISCVLayoutRecord &B) {
+               return std::make_pair(A.LatestEnd, A.Function->getAddress()) <
+                      std::make_pair(B.LatestEnd, B.Function->getAddress());
+             });
+
+  std::error_code EC;
+  raw_fd_ostream Report(opts::RISCVInstrumentationLayoutReport, EC,
+                        sys::fs::OF_Text);
+  if (EC)
+    return errorCodeToError(EC);
+  std::unique_ptr<raw_fd_ostream> Order;
+  if (AllOrderNamesVerified && !opts::RISCVInstrumentationOrderFile.empty()) {
+    Order = std::make_unique<raw_fd_ostream>(
+        opts::RISCVInstrumentationOrderFile, EC, sys::fs::OF_Text);
+    if (EC)
+      return errorCodeToError(EC);
+  }
+
+  const uint64_t Base =
+      alignTo(BC.LayoutStartAddress,
+              std::max<uint64_t>(1, std::max(BC.AlignText, BC.AlignFunctions)));
+  Report
+      << json::Object{{"kind", "model"},
+                      {"version", 1},
+                      {"model", "whole-function-fixed-data-window"},
+                      {"stage", "reorder-functions"},
+                      {"candidate_order",
+                       "earliest-deadline-then-input-address"},
+                      {"text_base_estimate", Base},
+                      {"minimum_displacement", -int64_t(Backward)},
+                      {"maximum_displacement", Forward},
+                      {"use_old_text", bool(opts::UseOldText)},
+                      {"hot_text", bool(opts::HotText)},
+                      {"hot_functions_at_end", bool(opts::HotFunctionsAtEnd)},
+                      {"data_reordering_requested", !opts::ReorderData.empty()},
+                      {"note", "Read-only candidate, not proof of linkability. "
+                               "Bounds cover "
+                               "whole estimated functions and worst-case "
+                               "alignment in one "
+                               "contiguous text section. Later splitting, "
+                               "section placement, "
+                               "relaxation, calls, moved data, injected "
+                               "functions, counters "
+                               "and runtime references are not modeled. Final "
+                               "JITLink range "
+                               "checks remain necessary."}}
+      << '\n';
+
+  // Track the interval of possible PCs from zero to maximum alignment padding.
+  // This uses one conservative window model, rather than interpreting an
+  // optimistic placement of an individual AUIPC as a safety guarantee.
+  uint64_t LowerCursor = Base;
+  uint64_t UpperCursor = Base;
+  uint64_t Violations = 0;
+  uint64_t FixedReferences = 0;
+  uint64_t UnresolvedReferences = 0;
+  uint64_t NonFixedReferences = 0;
+  uint64_t ConstrainedFunctions = 0;
+  uint64_t UnverifiedNames = 0;
+  uint64_t Rank = 0;
+  for (const RISCVLayoutRecord &R : Records) {
+    const BinaryFunction &BF = *R.Function;
+    const uint64_t EndUpper = UpperCursor + R.AlignmentBudget + R.Size;
+    const bool ViolatesWindow =
+        LowerCursor < R.EarliestStart || EndUpper > R.LatestEnd;
+    Violations += ViolatesWindow;
+    FixedReferences += R.FixedReferences;
+    UnresolvedReferences += R.UnresolvedReferences;
+    NonFixedReferences += R.NonFixedReferences;
+    ConstrainedFunctions += R.FixedReferences != 0;
+    UnverifiedNames += !R.OrderNameVerified;
+    Report << json::Object{{"kind", "function"},
+                           {"name", BF.getOneName()},
+                           {"input_address", BF.getAddress()},
+                           {"input_size", BF.getSize()},
+                           {"estimated_size", R.Size},
+                           {"alignment_budget", R.AlignmentBudget},
+                           {"fixed_references", R.FixedReferences},
+                           {"unresolved_references", R.UnresolvedReferences},
+                           {"nonfixed_references", R.NonFixedReferences},
+                           {"window_start_lower", R.EarliestStart},
+                           {"window_end_upper", R.FixedReferences
+                                                    ? json::Value(R.LatestEnd)
+                                                    : json::Value(nullptr)},
+                           {"candidate_rank", Rank++},
+                           {"candidate_start_lower", LowerCursor},
+                           {"candidate_end_upper", EndUpper},
+                           {"deadline_slack",
+                            R.FixedReferences
+                                ? json::Value(int64_t(R.LatestEnd) -
+                                              int64_t(EndUpper))
+                                : json::Value(nullptr)},
+                           {"window_violation", ViolatesWindow},
+                           {"order_name_verified", R.OrderNameVerified}}
+           << '\n';
+    if (Order)
+      *Order << BF.getOneName() << '\n';
+    LowerCursor += R.Size;
+    UpperCursor = EndUpper;
+  }
+  Report << json::Object{{"kind", "summary"},
+                         {"functions", Records.size()},
+                         {"constrained_functions", ConstrainedFunctions},
+                         {"estimated_bytes", LowerCursor - Base},
+                         {"alignment_budget", UpperCursor - LowerCursor},
+                         {"candidate_end_upper", UpperCursor},
+                         {"window_violations", Violations},
+                         {"fixed_references", FixedReferences},
+                         {"unresolved_references", UnresolvedReferences},
+                         {"nonfixed_references", NonFixedReferences},
+                         {"split_functions", SplitFunctions},
+                         {"island_functions", IslandFunctions},
+                         {"order_file_written", bool(Order)},
+                         {"unverified_order_names", UnverifiedNames}}
+         << '\n';
+  Report.flush();
+  if (Report.has_error())
+    return errorCodeToError(Report.error());
+  if (Order) {
+    Order->flush();
+    if (Order->has_error())
+      return errorCodeToError(Order->error());
+  }
+  if (!AllOrderNamesVerified && !opts::RISCVInstrumentationOrderFile.empty())
+    BC.errs() << "BOLT-WARNING: " << UnverifiedNames
+              << " function names do not round-trip through --function-order; "
+                 "no order file was written. Any existing file at "
+              << opts::RISCVInstrumentationOrderFile
+              << " does not belong to this report\n";
+  BC.outs()
+      << "BOLT-INFO: RISC-V instrumentation layout report: " << Records.size()
+      << " functions, " << Violations
+      << " candidate window violations; final linkability is not proven\n";
+  return Error::success();
+}
+
+} // namespace
+
 Error ReorderFunctions::runOnFunctions(BinaryContext &BC) {
+  if (Error E = reportRISCVInstrumentationLayout(BC))
+    return E;
   auto &BFs = BC.getBinaryFunctions();
 
   if (opts::ReorderFunctions == RT_HFSORT_PLUS) {

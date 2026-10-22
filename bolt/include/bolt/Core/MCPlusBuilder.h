@@ -905,6 +905,12 @@ public:
     return false;
   }
 
+  /// Return the unqualified expression of a RISC-V AUIPC %pcrel_hi operand,
+  /// or nullptr for other instructions. This does not include call pairs.
+  virtual const MCExpr *getRISCVPCRelHi20Expr(const MCInst &Inst) const {
+    return nullptr;
+  }
+
   virtual bool isCleanReg(const MCInst &Inst) const {
     llvm_unreachable("not implemented");
     return false;
